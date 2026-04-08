@@ -84,6 +84,11 @@ enum ToolHandler {
 pub fn default_tools() -> Vec<Tool> {
     vec![
         Tool::built_in(
+            "queue_ingress",
+            "Normalize text, image, video, or audio ingress payloads, analyze them, and append them to the persistent ingestion queue.",
+            tool_queue_ingress,
+        ),
+        Tool::built_in(
             "echo",
             "Return the user request as-is. Useful for simple tool-call flow tests.",
             tool_echo,
@@ -99,6 +104,13 @@ pub fn default_tools() -> Vec<Tool> {
             tool_web_search_perplexity,
         ),
     ]
+}
+
+fn tool_queue_ingress(user_input: &str, arguments: &Value) -> StepOutcome {
+    match crate::ingress::queue_ingress(user_input, arguments) {
+        Ok(ack) => StepOutcome::Success(ack.render()),
+        Err(reason) => StepOutcome::Retry(format!("Ingress queueing failed: {reason}")),
+    }
 }
 
 fn tool_echo(user_input: &str, arguments: &Value) -> StepOutcome {

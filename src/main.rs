@@ -1,6 +1,7 @@
 #[allow(non_snake_case)]
 mod Tools;
 
+mod ingress;
 mod mcp;
 
 #[allow(non_snake_case)]
@@ -397,11 +398,11 @@ fn parse_common_flags(args: &[String]) -> Result<(Option<String>, Option<String>
 
 fn general_help_text(bin_name: &str) -> String {
     format!(
-        "{bin_name} provides a simple CLI for interacting with the Rust agent template.\n\n\
+        "{bin_name} provides a simple CLI for interacting with the Rust ingress agent template.\n\n\
 Usage:\n  {bin_name} chat [--system <prompt>] [--trace]\n  {bin_name} run [--system <prompt>] [--input <message>] [--trace]\n  {bin_name} list\n  {bin_name} help [run|chat|list|examples]\n\n\
-Commands:\n  chat   Start an interactive session for developers or end users.\n  run    Execute a single agent run from flags or environment variables.\n  list   Show available tools, skills, and model policy.\n  help   Show detailed command help and developer examples.\n\n\
+Commands:\n  chat   Start an interactive session for developers or end users.\n  run    Submit a single ingress payload from flags or environment variables.\n  list   Show available tools, skills, and model policy.\n  help   Show detailed command help and developer examples.\n\n\
 Flags:\n  --system <prompt>  Override the system prompt.\n  --input <message>   Provide the user input for a single run.\n  --trace             Print the execution trace after each run.\n\n\
-Environment:\n  OPENAI_API_KEY      Enables the real OpenAI planner.\n  OPENAI_MODEL        Overrides the OpenAI model ID (default: {DEFAULT_OPENAI_MODEL}).\n  OPENAI_BASE_URL     Overrides the Responses API URL.\n  PERPLEXITY_API_KEY  Enables the Perplexity web_search tool.\n  PERPLEXITY_MODEL    Overrides the Perplexity model ID (default: {DEFAULT_PERPLEXITY_MODEL}).\n  PERPLEXITY_BASE_URL Overrides the Perplexity API URL.\n  MCP_SERVERS         JSON array describing stdio MCP servers to load at startup.\n  AGENT_SYSTEM_PROMPT Default system prompt when --system is omitted.\n  AGENT_USER_INPUT    Default input for `run` when --input is omitted.\n\n\
+Environment:\n  OPENAI_API_KEY      Enables the real OpenAI planner.\n  OPENAI_MODEL        Overrides the OpenAI model ID (default: {DEFAULT_OPENAI_MODEL}).\n  OPENAI_BASE_URL     Overrides the Responses API URL.\n  PERPLEXITY_API_KEY  Enables the Perplexity web_search tool.\n  PERPLEXITY_MODEL    Overrides the Perplexity model ID (default: {DEFAULT_PERPLEXITY_MODEL}).\n  PERPLEXITY_BASE_URL Overrides the Perplexity API URL.\n  MCP_SERVERS         JSON array describing stdio MCP servers to load at startup.\n  AGENT_QUEUE_FILE    Overrides the ingress queue file path (default: Workspace/ingress_queue.jsonl).\n  AGENT_SYSTEM_PROMPT Default system prompt when --system is omitted.\n  AGENT_USER_INPUT    Default input for `run` when --input is omitted.\n\n\
 Skills:\n  - Installed skills are auto-discovered from `skills/<skill-name>/SKILL.md`.\n  - Repo-local installed skills appear in `list` and `/skills` automatically.\n\n\
 Help topics:\n  {bin_name} help run\n  {bin_name} help chat\n  {bin_name} help list\n  {bin_name} help examples\n"
     )
@@ -409,32 +410,33 @@ Help topics:\n  {bin_name} help run\n  {bin_name} help chat\n  {bin_name} help l
 
 fn run_help_text(bin_name: &str) -> String {
     format!(
-        "Run a single agent request.\n\n\
+        "Run a single ingress submission.\n\n\
 Usage:\n  {bin_name} run --input <message>\n  {bin_name} run --system <prompt> --input <message> --trace\n\n\
-Developer notes:\n  - Use `run` for smoke tests, scripts, and reproducible CLI checks.\n  - If `OPENAI_API_KEY` is set, the planner uses the OpenAI Responses API.\n  - OpenAI-backed runs stream planner reasoning summaries live as tokens arrive.\n  - If `PERPLEXITY_API_KEY` is set, the `web_search` tool can run grounded web research.\n  - If `MCP_SERVERS` is set, stdio MCP tools are discovered at startup and added to the catalog.\n  - If `--system` is omitted, the CLI uses `AGENT_SYSTEM_PROMPT` or prompts for one.\n  - If `--input` is omitted, the CLI uses `AGENT_USER_INPUT` or prompts for one.\n  - Installed skills under `skills/` are discovered automatically at startup.\n  - `--trace` prints planner, tool, skill, retry, and stop events.\n\n\
-Examples:\n  {bin_name} run --input \"Use tool echo on this message.\"\n  {bin_name} run --input \"Explain how this agent works.\" --trace\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Use tool web_search to research the current Rust async runtime landscape.\" --trace\n  MCP_SERVERS='[{{\"name\":\"demo\",\"command\":\"/path/to/server\",\"args\":[]}}]' {bin_name} run --input \"Use tool mcp::demo::hello with {{\\\"name\\\":\\\"Aya\\\"}}\" --trace\n  OPENAI_MODEL=gpt-5.4 {bin_name} run --input \"Write a short release note for this project.\"\n"
+Developer notes:\n  - Use `run` for ingress smoke tests, scripts, and reproducible queue submissions.\n  - If `OPENAI_API_KEY` is set, the planner uses the OpenAI Responses API.\n  - The default behavior is to normalize inbound text/image/video/audio payloads and append them to the ingress queue.\n  - OpenAI-backed runs still stream planner reasoning summaries live as tokens arrive.\n  - If `PERPLEXITY_API_KEY` is set, explicit `web_search` tool requests can still run grounded web research.\n  - If `MCP_SERVERS` is set, stdio MCP tools are discovered at startup and added to the catalog.\n  - `AGENT_QUEUE_FILE` overrides where queued ingress records are written.\n  - If `--system` is omitted, the CLI uses `AGENT_SYSTEM_PROMPT` or prompts for one.\n  - If `--input` is omitted, the CLI uses `AGENT_USER_INPUT` or prompts for one.\n  - Installed skills under `skills/` are discovered automatically at startup.\n  - `--trace` prints planner, tool, skill, retry, and stop events.\n\n\
+Examples:\n  {bin_name} run --input \"Simple inbound text to queue.\" --trace\n  {bin_name} run --input '{{\"source\":\"whatsapp\",\"items\":[{{\"type\":\"text\",\"text\":\"Review this invoice\"}},{{\"type\":\"image\",\"path\":\"inbox/invoice.jpg\",\"notes\":\"customer upload\"}}]}}' --trace\n  AGENT_QUEUE_FILE=/tmp/ingress.jsonl {bin_name} run --input '{{\"source\":\"voice\",\"items\":[{{\"type\":\"audio\",\"path\":\"calls/voicemail.wav\",\"transcript\":\"Call me back about the order\"}}]}}'\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Use tool web_search to research the current Rust async runtime landscape.\" --trace\n  MCP_SERVERS='[{{\"name\":\"demo\",\"command\":\"/path/to/server\",\"args\":[]}}]' {bin_name} run --input \"Use tool mcp::demo::hello with {{\\\"name\\\":\\\"Aya\\\"}}\" --trace\n  OPENAI_MODEL=gpt-5.4 {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Analyze and queue this support escalation\"}}]}}' --trace\n"
     )
 }
 
 fn list_help_text(bin_name: &str) -> String {
     format!(
-        "Show the current agent catalog.\n\n\
+        "Show the current ingress-agent catalog.\n\n\
 Usage:\n  {bin_name} list\n\n\
-Developer notes:\n  - Prints the model policy plus registered tools and skills.\n  - Includes repo-local installed skills discovered from `skills/`.\n  - Shows whether the OpenAI planner is enabled from the current environment.\n"
+Developer notes:\n  - Prints the model policy plus registered tools and skills.\n  - The built-in `queue_ingress` tool is the default operational path for inbound payloads.\n  - Includes repo-local installed skills discovered from `skills/`.\n  - Shows whether the OpenAI planner is enabled from the current environment.\n"
     )
 }
 
 fn examples_help_text(bin_name: &str) -> String {
     format!(
-        "Common developer workflows.\n\n\
+        "Common ingress-agent workflows.\n\n\
 Inspect the template surface:\n  {bin_name} list\n\n\
-Run one reproducible request:\n  {bin_name} run --input \"Use tool word_count for this sentence.\" --trace\n\n\
-Run a real OpenAI-backed request:\n  OPENAI_API_KEY=<your-key> {bin_name} run --input \"Explain the current agent loop in plain English.\"\n\n\
-Run grounded web research through Perplexity:\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Research: current AI chip export rules in the US\"\n\n\
+Queue a plain text inbound message:\n  {bin_name} run --input \"A new customer message arrived.\" --trace\n\n\
+Queue a multimodal inbound message:\n  {bin_name} run --input '{{\"source\":\"mobile-app\",\"items\":[{{\"type\":\"text\",\"text\":\"Please inspect this damaged package\"}},{{\"type\":\"image\",\"path\":\"uploads/package.jpg\"}}]}}' --trace\n\n\
+Run an OpenAI-backed ingress submission:\n  OPENAI_API_KEY=<your-key> {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Queue this escalated support case\"}}]}}' --trace\n\n\
+Run grounded web research through Perplexity:\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Use tool web_search to research the current AI chip export rules in the US\" --trace\n\n\
 Inspect MCP-discovered tools:\n  MCP_SERVERS='[{{\"name\":\"demo\",\"command\":\"/path/to/server\",\"args\":[]}}]' {bin_name} list\n\n\
 Open an interactive session:\n  {bin_name} chat --trace\n\n\
 Install a repo-local skill and run it:\n  mkdir -p skills/my-skill && $EDITOR skills/my-skill/SKILL.md\n  {bin_name} list\n  {bin_name} run --input \"Use skill my-skill to help with this task.\" --trace\n\n\
-Use environment defaults:\n  AGENT_SYSTEM_PROMPT=\"You are a debugging assistant.\" AGENT_USER_INPUT=\"Summarize the template.\" {bin_name} run\n"
+Use environment defaults:\n  AGENT_SYSTEM_PROMPT=\"You are an ingress triage agent.\" AGENT_USER_INPUT='{{\"source\":\"cli\",\"items\":[{{\"type\":\"text\",\"text\":\"Summarize the template.\"}}]}}' {bin_name} run\n"
     )
 }
 
@@ -443,9 +445,9 @@ fn help_text(bin_name: &str, topic: &HelpTopic) -> String {
         HelpTopic::General => general_help_text(bin_name),
         HelpTopic::Run => run_help_text(bin_name),
         HelpTopic::Chat => format!(
-            "Start an interactive CLI session.\n\n\
+            "Start an interactive ingress CLI session.\n\n\
 Usage:\n  {bin_name} chat\n  {bin_name} chat --system <prompt> --trace\n\n\
-Developer notes:\n  - This delegates to the persistent wait loop owned by `mainAgent`.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - Installed skills under `skills/` appear in `/skills` automatically.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n"
+Developer notes:\n  - This delegates to the persistent wait loop owned by `mainAgent`.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - Non-empty inbound messages queue by default through the ingress pipeline.\n  - Installed skills under `skills/` appear in `/skills` automatically.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n"
         ),
         HelpTopic::List => list_help_text(bin_name),
         HelpTopic::Examples => examples_help_text(bin_name),
@@ -457,6 +459,10 @@ fn print_catalog(agent: &MainAgent) {
     println!("- default: {}", agent.default_model());
     println!("- fallback: {}", agent.fallback_model());
     println!("- planner backend: {}", agent.planner_backend_label());
+    println!(
+        "- ingress queue file: {}",
+        crate::ingress::resolve_queue_path().display()
+    );
 
     if !agent.mcp_servers().is_empty() {
         println!("\nLoaded MCP servers:");

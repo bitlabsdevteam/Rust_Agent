@@ -13,8 +13,8 @@ use std::time::Duration;
 
 const EXIT_COMMANDS: &[&str] = &["exit", "quit", ":q"];
 const MAX_RETRIES: u8 = 3;
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a simple Rust agent.";
-pub const DEFAULT_USER_INPUT: &str = "Use tool echo on this message.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are the ingress and data ingestion agent. Accept incoming text, image, video, and audio payloads, normalize them, analyze them, and queue them for downstream processing.";
+pub const DEFAULT_USER_INPUT: &str = "{\"source\":\"cli\",\"items\":[{\"type\":\"text\",\"text\":\"Analyze this inbound request and queue it.\"}]}";
 const DEFAULT_MODEL: &str = "OpenAI GPT-5.4";
 const FALLBACK_MODEL: &str = "Opus 4.6";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4";
@@ -812,9 +812,9 @@ fn render_skill_fallback_output(
 
 fn chat_help_text(bin_name: &str) -> String {
     format!(
-        "Start an interactive CLI session.\n\n\
+        "Start an interactive ingress CLI session.\n\n\
 Usage:\n  {bin_name} chat\n  {bin_name} chat --system <prompt> --trace\n\n\
-Developer notes:\n  - This mode keeps the main agent in a persistent wait loop until new context arrives.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n\n\
+Developer notes:\n  - This mode keeps the main agent in a persistent wait loop until new context arrives.\n  - Non-empty inbound messages are queued by default through the ingress pipeline.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n\n\
 In-session commands:\n  /help    Show chat help.\n  /system  Show the active system prompt.\n  /tools   Show available tools.\n  /skills  Show available skills.\n  /trace   Toggle execution trace output.\n  /exit    Leave the chat session.\n"
     )
 }
@@ -1229,7 +1229,7 @@ struct PlannerPayload {
     #[serde(default)]
     tool_name: String,
     #[serde(default)]
-    tool_arguments: Value,
+    tool_arguments_json: String,
     #[serde(default)]
     skill_name: String,
     #[serde(default)]
@@ -1256,16 +1256,8 @@ fn planner_schema() -> Value {
             "tool_name": {
                 "type": "string"
             },
-            "tool_arguments": {
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "additionalProperties": true
-                    },
-                    {
-                        "type": "null"
-                    }
-                ]
+            "tool_arguments_json": {
+                "type": "string"
             },
             "skill_name": {
                 "type": "string"
@@ -1277,7 +1269,7 @@ fn planner_schema() -> Value {
                 "type": "string"
             }
         },
-        "required": ["action", "tool_name", "tool_arguments", "skill_name", "answer", "reason"]
+        "required": ["action", "tool_name", "tool_arguments_json", "skill_name", "answer", "reason"]
     })
 }
 
@@ -1319,17 +1311,18 @@ fn planner_prompt(state: &AgentState, tools: &[Tool], skills: &[Skill]) -> Strin
         .join("\n");
 
     format!(
-        "You are the planner for a Rust ReAct agent. Choose exactly one next action.\n\
+        "You are the planner for a Rust ingress and data-ingestion agent. Choose exactly one next action.\n\
 Return JSON only matching the required schema.\n\
 Rules:\n\
+- The default operational path is ingress: for any non-empty inbound message that is not an explicit developer request to use another tool or skill, choose action=`tool` with `tool_name`=`queue_ingress`.\n\
 - Choose action=`tool` only when one of the listed tools should be executed now.\n\
-- For action=`tool`, set `tool_name` to the exact tool identifier from the list and set `tool_arguments` to a JSON object that matches the described input shape. Use `{{}}` when no arguments are needed.\n\
+- For action=`tool`, set `tool_name` to the exact tool identifier from the list and set `tool_arguments_json` to a compact JSON string encoding an object that matches the described input shape. Use `{{}}` when no arguments are needed.\n\
 - Choose action=`skill` only when one of the listed skills should be executed now.\n\
 - Choose action=`retry` only for recoverable errors or when another attempt is required.\n\
 - Choose action=`stop` for explicit stop conditions such as empty input or retry exhaustion.\n\
 - Otherwise choose action=`finish` and put the full assistant reply in `answer`.\n\
 - When action is not `tool`, leave `tool_name` as an empty string.\n\
-- When action is not `tool`, leave `tool_arguments` as an empty object.\n\
+- When action is not `tool`, leave `tool_arguments_json` as `\"{{}}\"`.\n\
 - When action is not `skill`, leave `skill_name` as an empty string.\n\
 - When action is not `finish`, leave `answer` as an empty string.\n\
 - Always fill `reason` with a short explanation.\n\
@@ -1359,15 +1352,8 @@ fn planner_payload_to_decision(
                 return Err(format!("Planner requested unknown tool `{tool_name}`"));
             }
 
-            let arguments = match &payload.tool_arguments {
-                Value::Null => json!({}),
-                Value::Object(_) => payload.tool_arguments.clone(),
-                other => {
-                    return Err(format!(
-                        "Planner returned non-object `tool_arguments` for `{tool_name}`: {other}"
-                    ))
-                }
-            };
+            let arguments =
+                parse_planner_tool_arguments(&payload.tool_arguments_json, &tool_name)?;
 
             Ok(Decision::CallTool {
                 tool_name,
@@ -1676,54 +1662,6 @@ fn decide_next_step_heuristic(
         }
     }
 
-    if lower.contains("use tool") || lower.starts_with("tool:") {
-        if lower.contains("web_search") {
-            return Decision::CallTool {
-                tool_name: "web_search".to_string(),
-                arguments: json!({
-                    "query": crate::Tools::extract_web_search_query(input)
-                }),
-                reason: "the request explicitly asks for grounded web research".to_string(),
-            };
-        }
-        if lower.contains("word_count") {
-            return Decision::CallTool {
-                tool_name: "word_count".to_string(),
-                arguments: json!({}),
-                reason: "the request explicitly asks for a word count".to_string(),
-            };
-        }
-        return Decision::CallTool {
-            tool_name: "echo".to_string(),
-            arguments: json!({}),
-            reason: "the request explicitly asks to use a tool without a more specific match"
-                .to_string(),
-        };
-    }
-
-    if lower.starts_with("search:") || lower.starts_with("research:") {
-        return Decision::CallTool {
-            tool_name: "web_search".to_string(),
-            arguments: json!({
-                "query": crate::Tools::extract_web_search_query(input)
-            }),
-            reason: "the request starts with a research-oriented prefix".to_string(),
-        };
-    }
-
-    if lower.contains("web search")
-        || lower.contains("research this")
-        || lower.starts_with("research ")
-    {
-        return Decision::CallTool {
-            tool_name: "web_search".to_string(),
-            arguments: json!({
-                "query": crate::Tools::extract_web_search_query(input)
-            }),
-            reason: "the request asks for research or web search".to_string(),
-        };
-    }
-
     if lower.contains("use skill") || lower.starts_with("skill:") {
         if let Some(skill_name) = find_skill_name_in_input(skills, &lower) {
             return Decision::CallSkill(
@@ -1750,12 +1688,21 @@ fn decide_next_step_heuristic(
         return Decision::Retry("input explicitly requested a retry".to_string());
     }
 
+    if tools.iter().any(|tool| tool.is_named("queue_ingress")) {
+        return Decision::CallTool {
+            tool_name: "queue_ingress".to_string(),
+            arguments: json!({}),
+            reason: "the main agent acts as the ingress layer and should queue inbound payloads"
+                .to_string(),
+        };
+    }
+
     Decision::Finish(
         format!(
-            "Final answer based on system prompt `{}` and user input `{}`.",
-            config.system_prompt, input
+            "Ingress agent received `{}` but no queue_ingress tool is available.",
+            input
         ),
-        "no tool, skill, retry, or stop condition was necessary".to_string(),
+        "the ingress queue tool was unavailable".to_string(),
     )
 }
 
@@ -1827,6 +1774,27 @@ fn normalize_tool_arguments(arguments: Value) -> Value {
     }
 }
 
+fn parse_planner_tool_arguments(raw: &str, tool_name: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({}));
+    }
+
+    let parsed = serde_json::from_str::<Value>(trimmed).map_err(|error| {
+        format!(
+            "Planner returned invalid JSON in `tool_arguments_json` for `{tool_name}`: {error}; raw={trimmed}"
+        )
+    })?;
+
+    match parsed {
+        Value::Object(_) => Ok(parsed),
+        Value::Null => Ok(json!({})),
+        other => Err(format!(
+            "Planner returned non-object JSON in `tool_arguments_json` for `{tool_name}`: {other}"
+        )),
+    }
+}
+
 fn skill_summarize(user_input: &str, _state: &AgentState) -> StepOutcome {
     let summary = user_input
         .split_whitespace()
@@ -1855,12 +1823,29 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn finishes_directly_when_no_tool_or_skill_is_requested() {
-        let agent = MainAgent::new("system".to_string());
-        let result = agent.run("Answer directly.");
+    fn heuristic_queues_plain_inbound_messages_by_default() {
+        let decision = decide_next_step_heuristic(
+            &AgentConfig {
+                system_prompt: "system".to_string(),
+                max_retries: MAX_RETRIES,
+                default_model: DEFAULT_MODEL,
+                fallback_model: FALLBACK_MODEL,
+                planner_model: None,
+            },
+            &default_tools(),
+            &built_in_skills(),
+            &AgentState::new(),
+            "Answer directly.",
+        );
 
-        assert_eq!(result.status, RunStatus::Completed);
-        assert!(result.output.contains("Final answer"));
+        assert!(matches!(
+            decision,
+            Decision::CallTool {
+                tool_name,
+                arguments,
+                ..
+            } if tool_name == "queue_ingress" && arguments == json!({})
+        ));
     }
 
     #[test]
@@ -1911,7 +1896,7 @@ mod tests {
         let payload = PlannerPayload {
             action: "tool".to_string(),
             tool_name: "echo".to_string(),
-            tool_arguments: json!({}),
+            tool_arguments_json: "{}".to_string(),
             skill_name: String::new(),
             answer: String::new(),
             reason: "tool needed".to_string(),
@@ -1934,7 +1919,7 @@ mod tests {
         let payload = PlannerPayload {
             action: "tool".to_string(),
             tool_name: "web_search".to_string(),
-            tool_arguments: json!({ "query": "rust news" }),
+            tool_arguments_json: "{\"query\":\"rust news\"}".to_string(),
             skill_name: String::new(),
             answer: String::new(),
             reason: "research needed".to_string(),
@@ -1950,6 +1935,19 @@ mod tests {
                 ..
             } if tool_name == "web_search" && arguments == json!({ "query": "rust news" })
         ));
+    }
+
+    #[test]
+    fn planner_schema_uses_stringified_tool_arguments_for_strict_json_schema() {
+        let schema = planner_schema();
+        let tool_arguments = schema
+            .get("properties")
+            .and_then(|properties| properties.get("tool_arguments_json"))
+            .expect("planner schema should define tool_arguments_json");
+
+        assert_eq!(tool_arguments.get("type"), Some(&json!("string")));
+        assert!(tool_arguments.get("additionalProperties").is_none());
+        assert!(tool_arguments.get("oneOf").is_none());
     }
 
     #[test]
