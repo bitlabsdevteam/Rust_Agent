@@ -1,16 +1,19 @@
 #[allow(non_snake_case)]
 mod Tools;
 
-mod ingress;
+mod agents;
 mod mcp;
+mod observability;
+mod runtime_log;
 
 #[allow(non_snake_case)]
 mod mainAgent;
 
 use crate::mainAgent::{
-    MainAgent, TerminalReasoningStreamer, WaitModeConfig, DEFAULT_OPENAI_MODEL,
-    DEFAULT_PERPLEXITY_MODEL, DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_INPUT,
+    MainAgent, QueueModeConfig, WaitModeConfig, DEFAULT_OPENAI_MODEL, DEFAULT_PERPLEXITY_MODEL,
+    DEFAULT_SYSTEM_PROMPT,
 };
+use crate::agents::ingress_agent::{DEFAULT_CONVERSATION_HISTORY_FILE, DEFAULT_QUEUE_FILE};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -400,9 +403,9 @@ fn general_help_text(bin_name: &str) -> String {
     format!(
         "{bin_name} provides a simple CLI for interacting with the Rust ingress agent template.\n\n\
 Usage:\n  {bin_name} chat [--system <prompt>] [--trace]\n  {bin_name} run [--system <prompt>] [--input <message>] [--trace]\n  {bin_name} list\n  {bin_name} help [run|chat|list|examples]\n\n\
-Commands:\n  chat   Start an interactive session for developers or end users.\n  run    Submit a single ingress payload from flags or environment variables.\n  list   Show available tools, skills, and model policy.\n  help   Show detailed command help and developer examples.\n\n\
-Flags:\n  --system <prompt>  Override the system prompt.\n  --input <message>   Provide the user input for a single run.\n  --trace             Print the execution trace after each run.\n\n\
-Environment:\n  OPENAI_API_KEY      Enables the real OpenAI planner.\n  OPENAI_MODEL        Overrides the OpenAI model ID (default: {DEFAULT_OPENAI_MODEL}).\n  OPENAI_BASE_URL     Overrides the Responses API URL.\n  PERPLEXITY_API_KEY  Enables the Perplexity web_search tool.\n  PERPLEXITY_MODEL    Overrides the Perplexity model ID (default: {DEFAULT_PERPLEXITY_MODEL}).\n  PERPLEXITY_BASE_URL Overrides the Perplexity API URL.\n  MCP_SERVERS         JSON array describing stdio MCP servers to load at startup.\n  AGENT_QUEUE_FILE    Overrides the ingress queue file path (default: Workspace/ingress_queue.jsonl).\n  AGENT_SYSTEM_PROMPT Default system prompt when --system is omitted.\n  AGENT_USER_INPUT    Default input for `run` when --input is omitted.\n\n\
+Commands:\n  chat   Start an interactive session for developers or end users.\n  run    Start the ingress runner and optionally bootstrap one ingress payload.\n  list   Show available tools, skills, and model policy.\n  help   Show detailed command help and developer examples.\n\n\
+Flags:\n  --system <prompt>  Override the system prompt.\n  --input <message>   Submit one bootstrap payload before waiting for more user input.\n  --trace             Print planner-agent trace output.\n\n\
+Environment:\n  OPENAI_API_KEY           Enables the real OpenAI planner.\n  OPENAI_MODEL             Overrides the OpenAI model ID (default: {DEFAULT_OPENAI_MODEL}).\n  OPENAI_BASE_URL          Overrides the Responses API URL.\n  PERPLEXITY_API_KEY       Enables the Perplexity web_search tool.\n  PERPLEXITY_MODEL         Overrides the Perplexity model ID (default: {DEFAULT_PERPLEXITY_MODEL}).\n  PERPLEXITY_BASE_URL      Overrides the Perplexity API URL.\n  MCP_SERVERS              JSON array describing stdio MCP servers to load at startup.\n  AGENT_QUEUE_FILE         Overrides the ingress queue file path (default: {DEFAULT_QUEUE_FILE}).\n  AGENT_QUEUE_POLL_INTERVAL_MS Overrides how often `run` checks for unplanned queue work (default: 1000).\n  AGENT_WORKSPACE_DIR      Overrides the workspace markdown directory used for planner and installed skill context (default: Workspace).\n  AGENT_SYSTEM_PROMPT      Default system prompt when --system is omitted.\n  AGENT_USER_INPUT         Default input for `run` when --input is omitted.\n\n\
 Skills:\n  - Installed skills are auto-discovered from `skills/<skill-name>/SKILL.md`.\n  - Repo-local installed skills appear in `list` and `/skills` automatically.\n\n\
 Help topics:\n  {bin_name} help run\n  {bin_name} help chat\n  {bin_name} help list\n  {bin_name} help examples\n"
     )
@@ -410,10 +413,10 @@ Help topics:\n  {bin_name} help run\n  {bin_name} help chat\n  {bin_name} help l
 
 fn run_help_text(bin_name: &str) -> String {
     format!(
-        "Run a single ingress submission.\n\n\
+        "Start the ingress runner.\n\n\
 Usage:\n  {bin_name} run --input <message>\n  {bin_name} run --system <prompt> --input <message> --trace\n\n\
-Developer notes:\n  - Use `run` for ingress smoke tests, scripts, and reproducible queue submissions.\n  - If `OPENAI_API_KEY` is set, the planner uses the OpenAI Responses API.\n  - The default behavior is to normalize inbound text/image/video/audio payloads and append them to the ingress queue.\n  - OpenAI-backed runs still stream planner reasoning summaries live as tokens arrive.\n  - If `PERPLEXITY_API_KEY` is set, explicit `web_search` tool requests can still run grounded web research.\n  - If `MCP_SERVERS` is set, stdio MCP tools are discovered at startup and added to the catalog.\n  - `AGENT_QUEUE_FILE` overrides where queued ingress records are written.\n  - If `--system` is omitted, the CLI uses `AGENT_SYSTEM_PROMPT` or prompts for one.\n  - If `--input` is omitted, the CLI uses `AGENT_USER_INPUT` or prompts for one.\n  - Installed skills under `skills/` are discovered automatically at startup.\n  - `--trace` prints planner, tool, skill, retry, and stop events.\n\n\
-Examples:\n  {bin_name} run --input \"Simple inbound text to queue.\" --trace\n  {bin_name} run --input '{{\"source\":\"whatsapp\",\"items\":[{{\"type\":\"text\",\"text\":\"Review this invoice\"}},{{\"type\":\"image\",\"path\":\"inbox/invoice.jpg\",\"notes\":\"customer upload\"}}]}}' --trace\n  AGENT_QUEUE_FILE=/tmp/ingress.jsonl {bin_name} run --input '{{\"source\":\"voice\",\"items\":[{{\"type\":\"audio\",\"path\":\"calls/voicemail.wav\",\"transcript\":\"Call me back about the order\"}}]}}'\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Use tool web_search to research the current Rust async runtime landscape.\" --trace\n  MCP_SERVERS='[{{\"name\":\"demo\",\"command\":\"/path/to/server\",\"args\":[]}}]' {bin_name} run --input \"Use tool mcp::demo::hello with {{\\\"name\\\":\\\"Aya\\\"}}\" --trace\n  OPENAI_MODEL=gpt-5.4 {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Analyze and queue this support escalation\"}}]}}' --trace\n"
+Developer notes:\n  - `run` accepts direct user ingress and also polls `ingress_queue.jsonl` for unplanned queued work.\n  - If `--input` or `AGENT_USER_INPUT` is provided, `run` first queues that payload as a bootstrap ingress submission.\n  - If `OPENAI_API_KEY` is set, the planner uses the OpenAI Responses API.\n  - The planner agent also picks up pre-existing and externally appended queue items, then writes next steps into `planner_queue.jsonl`.\n  - If `PERPLEXITY_API_KEY` is set, explicit `web_search` tool requests can still run grounded web research.\n  - If `MCP_SERVERS` is set, stdio MCP tools are discovered at startup and added to the catalog.\n  - `AGENT_QUEUE_FILE` overrides where queued ingress records are written.\n  - `AGENT_QUEUE_POLL_INTERVAL_MS` overrides how often the planner checks for unplanned queue work.\n  - `AGENT_WORKSPACE_DIR` overrides which workspace markdown files are injected into installed skills and the planner skill.\n  - `{DEFAULT_CONVERSATION_HISTORY_FILE}` is created on demand and reused for ingress context compaction.\n  - If `--system` is omitted, the CLI uses `AGENT_SYSTEM_PROMPT` or prompts for one.\n  - Installed skills under `skills/` are discovered automatically at startup and shown in the waiting roster.\n  - `--trace` prints planner-agent trace output for ingress events.\n  - Stop the ingress runner with `exit`, `quit`, `:q`, or EOF.\n\n\
+Examples:\n  {bin_name} run\n  {bin_name} run --input \"Simple inbound text to queue.\" --trace\n  {bin_name} run --input '{{\"source\":\"whatsapp\",\"items\":[{{\"type\":\"text\",\"text\":\"Review this invoice\"}},{{\"type\":\"image\",\"path\":\"inbox/invoice.jpg\",\"notes\":\"customer upload\"}}]}}' --trace\n  AGENT_QUEUE_FILE=/tmp/ingress.jsonl {bin_name} run --input '{{\"source\":\"voice\",\"items\":[{{\"type\":\"audio\",\"path\":\"calls/voicemail.wav\",\"transcript\":\"Call me back about the order\"}}]}}'\n  OPENAI_MODEL=gpt-5.4 {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Classify and queue this support escalation\"}}]}}' --trace\n"
     )
 }
 
@@ -430,8 +433,9 @@ fn examples_help_text(bin_name: &str) -> String {
         "Common ingress-agent workflows.\n\n\
 Inspect the template surface:\n  {bin_name} list\n\n\
 Queue a plain text inbound message:\n  {bin_name} run --input \"A new customer message arrived.\" --trace\n\n\
+Trigger ingress plus planner queue generation:\n  {bin_name} run --input \"A new customer message arrived.\" --trace\n\n\
 Queue a multimodal inbound message:\n  {bin_name} run --input '{{\"source\":\"mobile-app\",\"items\":[{{\"type\":\"text\",\"text\":\"Please inspect this damaged package\"}},{{\"type\":\"image\",\"path\":\"uploads/package.jpg\"}}]}}' --trace\n\n\
-Run an OpenAI-backed ingress submission:\n  OPENAI_API_KEY=<your-key> {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Queue this escalated support case\"}}]}}' --trace\n\n\
+Run an OpenAI-backed ingress submission:\n  OPENAI_API_KEY=<your-key> {bin_name} run --input '{{\"source\":\"api\",\"items\":[{{\"type\":\"text\",\"text\":\"Classify and queue this escalated support case\"}}]}}' --trace\n\n\
 Run grounded web research through Perplexity:\n  PERPLEXITY_API_KEY=<your-key> {bin_name} run --input \"Use tool web_search to research the current AI chip export rules in the US\" --trace\n\n\
 Inspect MCP-discovered tools:\n  MCP_SERVERS='[{{\"name\":\"demo\",\"command\":\"/path/to/server\",\"args\":[]}}]' {bin_name} list\n\n\
 Open an interactive session:\n  {bin_name} chat --trace\n\n\
@@ -447,7 +451,7 @@ fn help_text(bin_name: &str, topic: &HelpTopic) -> String {
         HelpTopic::Chat => format!(
             "Start an interactive ingress CLI session.\n\n\
 Usage:\n  {bin_name} chat\n  {bin_name} chat --system <prompt> --trace\n\n\
-Developer notes:\n  - This delegates to the persistent wait loop owned by `mainAgent`.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - Non-empty inbound messages queue by default through the ingress pipeline.\n  - Installed skills under `skills/` appear in `/skills` automatically.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n"
+Developer notes:\n  - This delegates to the persistent wait loop owned by `mainAgent`.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - Repo and workspace markdown plus persisted conversation history are compacted into the planner context.\n  - Installed skills under `skills/` appear in `/skills` automatically.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n"
         ),
         HelpTopic::List => list_help_text(bin_name),
         HelpTopic::Examples => examples_help_text(bin_name),
@@ -461,7 +465,7 @@ fn print_catalog(agent: &MainAgent) {
     println!("- planner backend: {}", agent.planner_backend_label());
     println!(
         "- ingress queue file: {}",
-        crate::ingress::resolve_queue_path().display()
+        crate::agents::ingress_agent::resolve_queue_path().display()
     );
 
     if !agent.mcp_servers().is_empty() {
@@ -479,24 +483,6 @@ fn print_catalog(agent: &MainAgent) {
     println!("\nAvailable skills:");
     for skill in agent.skills() {
         println!("- {}: {}", skill.name(), skill.description());
-    }
-}
-
-fn print_run_result(result: &mainAgent::AgentResult, show_trace: bool, show_reasoning: bool) {
-    println!("Status: {:?}", result.status);
-    if show_reasoning && !result.reasoning.is_empty() {
-        println!("Reasoning:");
-        for step in &result.reasoning {
-            println!("- {step}");
-        }
-    }
-    println!("Output: {}", result.output);
-
-    if show_trace {
-        println!("Trace:");
-        for step in &result.trace {
-            println!("- {step}");
-        }
     }
 }
 
@@ -526,14 +512,17 @@ fn resolve_system_prompt(explicit: Option<String>) -> io::Result<String> {
     }
 }
 
-fn resolve_user_input(explicit: Option<String>) -> io::Result<String> {
+fn resolve_bootstrap_input(explicit: Option<String>) -> Option<String> {
     if let Some(value) = explicit {
-        return Ok(value);
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
     }
 
     match env::var("AGENT_USER_INPUT") {
-        Ok(value) if !value.trim().is_empty() => Ok(value),
-        _ => read_prompt("User input", DEFAULT_USER_INPUT),
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => None,
     }
 }
 
@@ -543,14 +532,17 @@ fn run_once(options: RunOptions) -> io::Result<()> {
         &resolve_system_prompt(options.system_prompt)?,
         &identity,
     );
-    let user_input = resolve_user_input(options.user_input)?;
+    runtime_log::info("main", "starting ingress runner mode");
     let agent = MainAgent::from_env(system_prompt)?;
-    let mut streamer = TerminalReasoningStreamer::new();
-    let result = agent.run_with_history_and_observer(&[], &user_input, Some(&mut streamer));
-    streamer.finish();
-
-    print_run_result(&result, options.show_trace, !streamer.emitted_any());
-    Ok(())
+    let bootstrap_input = resolve_bootstrap_input(options.user_input);
+    agent.wait_for_queue(
+        QueueModeConfig {
+            agent_name: identity.agent_name.clone(),
+            agent_icon: identity.agent_icon.clone(),
+            show_trace: options.show_trace,
+        },
+        bootstrap_input.as_deref(),
+    )
 }
 
 fn run_chat(options: ChatOptions) -> io::Result<()> {
@@ -559,6 +551,7 @@ fn run_chat(options: ChatOptions) -> io::Result<()> {
         &resolve_system_prompt(options.system_prompt)?,
         &identity,
     );
+    runtime_log::info("main", "starting interactive chat mode");
     let agent = MainAgent::from_env(system_prompt)?;
     agent.wait_for_context(WaitModeConfig {
         prompt_label: identity.prompt_label().to_string(),
@@ -572,6 +565,7 @@ fn run_chat(options: ChatOptions) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let _ = dotenvy::dotenv();
+    runtime_log::info("main", "process booted");
 
     let args: Vec<String> = env::args().skip(1).collect();
     let bin_name = env::args()

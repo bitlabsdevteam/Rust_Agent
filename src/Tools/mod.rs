@@ -1,5 +1,6 @@
 mod web_search_tool_perplexity;
 
+#[cfg(test)]
 pub(crate) use web_search_tool_perplexity::{
     extract_web_search_query, format_perplexity_response, PerplexityResponse,
 };
@@ -85,7 +86,7 @@ pub fn default_tools() -> Vec<Tool> {
     vec![
         Tool::built_in(
             "queue_ingress",
-            "Normalize text, image, video, or audio ingress payloads, analyze them, and append them to the persistent ingestion queue.",
+            "Normalize text, image, video, or audio ingress payloads, classify them, and append them to the persistent ingestion queue.",
             tool_queue_ingress,
         ),
         Tool::built_in(
@@ -107,7 +108,7 @@ pub fn default_tools() -> Vec<Tool> {
 }
 
 fn tool_queue_ingress(user_input: &str, arguments: &Value) -> StepOutcome {
-    match crate::ingress::queue_ingress(user_input, arguments) {
+    match crate::agents::ingress_agent::queue_ingress(user_input, arguments) {
         Ok(ack) => StepOutcome::Success(ack.render()),
         Err(reason) => StepOutcome::Retry(format!("Ingress queueing failed: {reason}")),
     }

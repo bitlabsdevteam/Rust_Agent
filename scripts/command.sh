@@ -58,7 +58,7 @@ start_agent() {
 
   default_inputs
   cd "$ROOT_DIR"
-  nohup cargo run >"$LOG_FILE" 2>&1 &
+  nohup cargo run -- run >"$LOG_FILE" 2>&1 &
 
   local agent_pid=$!
   echo "$agent_pid" >"$PID_FILE"
@@ -105,7 +105,7 @@ status_agent() {
 run_agent() {
   default_inputs
   cd "$ROOT_DIR"
-  cargo run
+  cargo run -- run
 }
 
 check_agent() {

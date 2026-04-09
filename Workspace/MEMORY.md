@@ -19,4 +19,5 @@ runs. Transient reasoning should stay in the execution trace, not here.
 
 - workspace identity is defined in `Workspace/IDENTITY.md`
 - repository-wide operating guidance is defined in `AGENTS.md`
+- memory-aware technical design guidance is defined in `TDD.md`
 - the current scaffold is a Rust starter for agentic systems
