@@ -33,9 +33,10 @@
   - Files: `src/mainAgent.rs`, optional new eval/reporting module
   - Completed: 2026-04-20 — Added planner backend and reasoning details to eval preview results and expanded failure rendering with structured input, observation, expected-vs-actual, and planner context lines.
 
-- [ ] Task 8: Add path-scoped memory precedence design notes and a narrow implementation hook (P1)
+- [x] Task 8: Add path-scoped memory precedence design notes and a narrow implementation hook (P1)
   - Acceptance: The repo documents intended memory precedence and introduces a small code seam for future path-scoped loading without widening runtime complexity.
   - Files: `docs/memory.md` or equivalent repo-local markdown, `src/mainAgent.rs`
+  - Completed: 2026-04-20 — Added `docs/memory.md`, linked it from `AGENTS.md`, and introduced `MemoryLoadRequest` plus source selector hints for future path-scoped memory loading while preserving current behavior.
 
 - [ ] Task 9: Add tests for the eval harness and fixture parsing path (P1)
   - Acceptance: Automated tests cover fixture loading, eval command behavior, and at least one failing-vs-passing planner case.

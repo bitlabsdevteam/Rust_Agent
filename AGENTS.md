@@ -30,6 +30,7 @@ Current repo-local reference docs:
 
 - `docs/architecture.md` - current CLI harness architecture, runtime loop, planner flow, memory surfaces, and extension points
 - `docs/cli.md` - operator guide for top-level commands, slash commands, memory behavior, and compaction
+- `docs/memory.md` - standing memory precedence, long-term memory role, and the path-scoped loading seam
 
 ## External AI Agent Reference
 

@@ -189,12 +189,45 @@ pub struct MemorySource {
     pub path: PathBuf,
     pub contents: String,
     pub imported_from: Option<PathBuf>,
+    pub selector_hint: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryLoadRequest {
+    pub focus_paths: Vec<PathBuf>,
+}
+
+impl MemoryLoadRequest {
+    pub fn normalized_focus_paths(&self, root_dir: &Path) -> Vec<PathBuf> {
+        let mut normalized = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for path in &self.focus_paths {
+            let candidate = if path.is_absolute() {
+                path.strip_prefix(root_dir).ok().map(Path::to_path_buf)
+            } else {
+                Some(path.clone())
+            };
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let Some(candidate) = normalize_repo_relative_path(&candidate) else {
+                continue;
+            };
+            if seen.insert(candidate.clone()) {
+                normalized.push(candidate);
+            }
+        }
+
+        normalized
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryStack {
     pub sources: Vec<MemorySource>,
     pub merged_instructions: String,
+    pub load_request: MemoryLoadRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -322,6 +355,7 @@ impl Mem0Config {
             path: self.source_path(),
             contents: render_mem0_memory_contents(self, &parse_mem0_list_response(&body)?),
             imported_from: None,
+            selector_hint: None,
         })
     }
 
@@ -1801,6 +1835,18 @@ impl MainAgent {
         lines.push(long_term_preview);
         lines.push(String::new());
         lines.push("Merged memory preview:".to_string());
+        let focus_paths = if self.memory_stack.load_request.focus_paths.is_empty() {
+            "inactive".to_string()
+        } else {
+            self.memory_stack
+                .load_request
+                .focus_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!("Path-scoped selection: {focus_paths}"));
         lines.push(observability::compact_text(
             &self.memory_stack.merged_instructions,
             800,
@@ -3270,12 +3316,28 @@ fn load_memory_stack(
     home_dir: Option<&Path>,
     mem0: Option<&Mem0Config>,
 ) -> io::Result<MemoryStack> {
+    load_memory_stack_with_request(
+        root_dir,
+        home_dir,
+        mem0,
+        &MemoryLoadRequest::default(),
+    )
+}
+
+fn load_memory_stack_with_request(
+    root_dir: &Path,
+    home_dir: Option<&Path>,
+    mem0: Option<&Mem0Config>,
+    request: &MemoryLoadRequest,
+) -> io::Result<MemoryStack> {
     let mut sources = Vec::new();
     let mut visited = BTreeSet::new();
+    let normalized_focus_paths = request.normalized_focus_paths(root_dir);
 
     if let Some(home_dir) = home_dir {
         let user_memory = home_dir.join(CLAUDE_DIR).join(PROJECT_MEMORY_FILE);
         load_memory_source(
+            root_dir,
             &user_memory,
             MemoryScope::User,
             None,
@@ -3287,6 +3349,7 @@ fn load_memory_stack(
 
     let project_memory = root_dir.join(PROJECT_MEMORY_FILE);
     load_memory_source(
+        root_dir,
         &project_memory,
         MemoryScope::Project,
         None,
@@ -3296,10 +3359,13 @@ fn load_memory_stack(
     )?;
 
     if let Some(mem0) = mem0 {
-        sources.push(mem0.fetch_long_term_memory()?);
+        let mut source = mem0.fetch_long_term_memory()?;
+        source.selector_hint = None;
+        sources.push(source);
     } else {
         let long_term_memory = agent_memory_paths(root_dir).long_term_notes;
         load_memory_source(
+            root_dir,
             &long_term_memory,
             MemoryScope::Project,
             Some(project_memory),
@@ -3325,6 +3391,9 @@ fn load_memory_stack(
     Ok(MemoryStack {
         sources,
         merged_instructions,
+        load_request: MemoryLoadRequest {
+            focus_paths: normalized_focus_paths,
+        },
     })
 }
 
@@ -3363,6 +3432,44 @@ fn save_short_term_memory(path: &Path, state: &SessionState) -> io::Result<()> {
     fs::write(path, serialized)
 }
 
+fn normalize_repo_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn memory_selector_hint(
+    root_dir: &Path,
+    source_path: &Path,
+    imported_from: Option<&Path>,
+) -> Option<PathBuf> {
+    imported_from?;
+    let canonical_root = fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+    let relative = source_path.strip_prefix(&canonical_root).ok()?;
+    let relative = normalize_repo_relative_path(relative)?;
+    if relative == Path::new(PROJECT_MEMORY_FILE) || relative.starts_with(WORKSPACE_DIR) {
+        return None;
+    }
+
+    relative
+        .parent()
+        .map(Path::to_path_buf)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
 fn append_long_term_memory(mem0: Option<&Mem0Config>, path: &Path, note: &str) -> io::Result<()> {
     if let Some(mem0) = mem0 {
         return mem0.append_long_term_memory(note);
@@ -3384,6 +3491,7 @@ fn append_long_term_memory(mem0: Option<&Mem0Config>, path: &Path, note: &str) -
 }
 
 fn load_memory_source(
+    root_dir: &Path,
     path: &Path,
     scope: MemoryScope,
     imported_from: Option<PathBuf>,
@@ -3406,10 +3514,12 @@ fn load_memory_source(
         path: canonical.clone(),
         contents: contents.clone(),
         imported_from: imported_from.clone(),
+        selector_hint: memory_selector_hint(root_dir, &canonical, imported_from.as_deref()),
     });
 
     for import_path in extract_imports(&contents, path) {
         load_memory_source(
+            root_dir,
             &import_path,
             MemoryScope::Imported,
             Some(canonical.clone()),
@@ -4431,6 +4541,51 @@ mod tests {
 
         assert_eq!(stack.sources.len(), 2);
         assert!(stack.merged_instructions.contains("Imported memory"));
+    }
+
+    #[test]
+    fn load_memory_stack_records_selector_hint_for_imported_project_memory() {
+        let root = temp_root("memory-selector-hint");
+        let imported_dir = root.join("docs/agents");
+        fs::create_dir_all(&imported_dir).expect("import dir");
+        let imported = imported_dir.join("memory.md");
+        fs::write(&imported, "# Scoped\nPath scoped memory").expect("imported file");
+        fs::write(
+            root.join("CLAUDE.md"),
+            format!("# Root\n@{}\n", imported.display()),
+        )
+        .expect("root memory");
+
+        let stack = load_memory_stack(&root, None, None).expect("memory stack should load");
+        let imported_source = stack
+            .sources
+            .iter()
+            .find(|source| source.path.ends_with("docs/agents/memory.md"))
+            .expect("imported source should exist");
+
+        assert_eq!(
+            imported_source.selector_hint.as_deref(),
+            Some(Path::new("docs/agents"))
+        );
+    }
+
+    #[test]
+    fn memory_load_request_normalizes_focus_paths_under_root() {
+        let root = temp_root("memory-load-request");
+        let request = MemoryLoadRequest {
+            focus_paths: vec![
+                root.join("src/main.rs"),
+                PathBuf::from("docs/architecture.md"),
+                PathBuf::from("../outside.md"),
+            ],
+        };
+
+        let normalized = request.normalized_focus_paths(&root);
+
+        assert_eq!(
+            normalized,
+            vec![PathBuf::from("src/main.rs"), PathBuf::from("docs/architecture.md")]
+        );
     }
 
     #[test]
