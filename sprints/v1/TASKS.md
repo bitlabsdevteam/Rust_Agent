@@ -18,9 +18,10 @@
   - Files: `evals/fixtures/*.json` or `*.jsonl`, `src/mainAgent.rs` or a new eval module
   - Completed: 2026-04-20 — Added a minimal JSON fixture schema, parser and loader in `src/evals.rs`, plus seed fixtures under `evals/fixtures/`.
 
-- [ ] Task 5: Add a CLI entrypoint to run eval fixtures (P0)
+- [x] Task 5: Add a CLI entrypoint to run eval fixtures (P0)
   - Acceptance: A new CLI command runs the eval fixtures and reports pass/fail for expected planner decisions.
   - Files: `src/main.rs`, `src/mainAgent.rs`, optional new eval module
+  - Completed: 2026-04-20 — Added `agent_in_rust eval`, a shared planner-preview eval path, and repo-local `ship-small` skill scaffolding so the seeded fixtures pass end-to-end.
 
 - [ ] Task 6: Add initial regression fixtures for core harness behavior (P0)
   - Acceptance: Fixtures cover tool selection, skill selection, subagent delegation, retry behavior, empty-input stop, and finish-on-observation.

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -23,6 +23,28 @@ pub struct PlannerEvalExpectedDecision {
     pub skill_name: Option<String>,
     #[serde(default)]
     pub subagent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerEvalActualDecision {
+    pub action: String,
+    pub tool_name: Option<String>,
+    pub skill_name: Option<String>,
+    pub subagent_name: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerEvalCaseResult {
+    pub fixture: PlannerEvalFixture,
+    pub actual: PlannerEvalActualDecision,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannerEvalSuiteResult {
+    pub fixture_dir: PathBuf,
+    pub cases: Vec<PlannerEvalCaseResult>,
 }
 
 #[allow(dead_code)]
@@ -93,6 +115,100 @@ fn require_target(value: &Option<String>, field_name: &str) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             format!("Eval fixture action requires non-empty `{field_name}`."),
         )),
+    }
+}
+
+impl PlannerEvalExpectedDecision {
+    pub fn matches(&self, actual: &PlannerEvalActualDecision) -> bool {
+        if self.action != actual.action {
+            return false;
+        }
+
+        match self.action.as_str() {
+            "tool" => self.tool_name == actual.tool_name,
+            "skill" => self.skill_name == actual.skill_name,
+            "delegate" => self.subagent_name == actual.subagent_name,
+            "finish" | "retry" | "stop" => true,
+            _ => false,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self.action.as_str() {
+            "tool" => format!(
+                "tool:{}",
+                self.tool_name.as_deref().unwrap_or("<missing>")
+            ),
+            "skill" => format!(
+                "skill:{}",
+                self.skill_name.as_deref().unwrap_or("<missing>")
+            ),
+            "delegate" => format!(
+                "delegate:{}",
+                self.subagent_name.as_deref().unwrap_or("<missing>")
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl PlannerEvalActualDecision {
+    pub fn summary(&self) -> String {
+        match self.action.as_str() {
+            "tool" => format!(
+                "tool:{}",
+                self.tool_name.as_deref().unwrap_or("<missing>")
+            ),
+            "skill" => format!(
+                "skill:{}",
+                self.skill_name.as_deref().unwrap_or("<missing>")
+            ),
+            "delegate" => format!(
+                "delegate:{}",
+                self.subagent_name.as_deref().unwrap_or("<missing>")
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl PlannerEvalSuiteResult {
+    pub fn passed(&self) -> usize {
+        self.cases.iter().filter(|case| case.passed).count()
+    }
+
+    pub fn failed(&self) -> usize {
+        self.cases.len().saturating_sub(self.passed())
+    }
+
+    pub fn render(&self) -> String {
+        let mut lines = vec![format!(
+            "Planner evals: {} passed, {} failed ({})",
+            self.passed(),
+            self.failed(),
+            self.fixture_dir.display()
+        )];
+
+        for case in &self.cases {
+            if case.passed {
+                lines.push(format!(
+                    "[PASS] {} expected: {} actual: {}",
+                    case.fixture.name,
+                    case.fixture.expected.summary(),
+                    case.actual.summary()
+                ));
+            } else {
+                lines.push(format!(
+                    "[FAIL] {} expected: {} actual: {} reason: {}",
+                    case.fixture.name,
+                    case.fixture.expected.summary(),
+                    case.actual.summary(),
+                    case.actual.reason
+                ));
+            }
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -188,5 +304,72 @@ mod tests {
         assert_eq!(fixtures.len(), 2);
         assert_eq!(fixtures[0].name, "first");
         assert_eq!(fixtures[1].name, "second");
+    }
+
+    #[test]
+    fn expected_decision_matches_tool_route() {
+        let expected = PlannerEvalExpectedDecision {
+            action: "tool".to_string(),
+            tool_name: Some("web_search".to_string()),
+            skill_name: None,
+            subagent_name: None,
+        };
+        let actual = PlannerEvalActualDecision {
+            action: "tool".to_string(),
+            tool_name: Some("web_search".to_string()),
+            skill_name: None,
+            subagent_name: None,
+            reason: "explicit tool request".to_string(),
+        };
+
+        assert!(expected.matches(&actual));
+    }
+
+    #[test]
+    fn eval_suite_render_includes_pass_fail_summary() {
+        let fixture = PlannerEvalFixture {
+            name: "tool routing".to_string(),
+            user_input: "search the web".to_string(),
+            observations: Vec::new(),
+            expected: PlannerEvalExpectedDecision {
+                action: "tool".to_string(),
+                tool_name: Some("web_search".to_string()),
+                skill_name: None,
+                subagent_name: None,
+            },
+        };
+        let passing = PlannerEvalCaseResult {
+            fixture: fixture.clone(),
+            actual: PlannerEvalActualDecision {
+                action: "tool".to_string(),
+                tool_name: Some("web_search".to_string()),
+                skill_name: None,
+                subagent_name: None,
+                reason: "explicit tool request".to_string(),
+            },
+            passed: true,
+        };
+        let failing = PlannerEvalCaseResult {
+            fixture,
+            actual: PlannerEvalActualDecision {
+                action: "delegate".to_string(),
+                tool_name: None,
+                skill_name: None,
+                subagent_name: Some("general-purpose".to_string()),
+                reason: "default delegation".to_string(),
+            },
+            passed: false,
+        };
+        let suite = PlannerEvalSuiteResult {
+            fixture_dir: PathBuf::from("evals/fixtures"),
+            cases: vec![passing, failing],
+        };
+        let report = suite.render();
+
+        assert!(report.contains("Planner evals: 1 passed, 1 failed"));
+        assert!(report.contains("[PASS] tool routing"));
+        assert!(report.contains("[FAIL] tool routing"));
+        assert!(report.contains("expected: tool:web_search"));
+        assert!(report.contains("actual: delegate:general-purpose"));
     }
 }
