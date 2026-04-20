@@ -539,7 +539,10 @@ fn run_session(agent: &mut MainAgent, options: SessionOptions) -> io::Result<()>
     })
 }
 
-fn run_evals(agent: &MainAgent, options: EvalOptions) -> io::Result<()> {
+fn build_eval_suite(
+    agent: &MainAgent,
+    options: EvalOptions,
+) -> io::Result<evals::PlannerEvalSuiteResult> {
     let fixture_dir = options
         .fixtures_dir
         .map(PathBuf::from)
@@ -564,8 +567,11 @@ fn run_evals(agent: &MainAgent, options: EvalOptions) -> io::Result<()> {
             }
         })
         .collect();
-    let suite = evals::PlannerEvalSuiteResult { fixture_dir, cases };
+    Ok(evals::PlannerEvalSuiteResult { fixture_dir, cases })
+}
 
+fn run_evals(agent: &MainAgent, options: EvalOptions) -> io::Result<()> {
+    let suite = build_eval_suite(agent, options)?;
     println!("{}", suite.render());
     if suite.failed() > 0 {
         return Err(io::Error::new(
@@ -682,6 +688,21 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        fs::create_dir_all(&path).expect("temp dir should exist");
+        path
+    }
 
     #[test]
     fn defaults_to_session_when_no_args_are_provided() {
@@ -851,5 +872,72 @@ mod tests {
 
         assert!(help.contains("agent_in_rust eval"));
         assert!(help.contains("help eval"));
+    }
+
+    #[test]
+    fn build_eval_suite_errors_when_fixture_dir_is_empty() {
+        let fixture_dir = temp_root("eval-empty");
+        let agent =
+            MainAgent::from_env(DEFAULT_SYSTEM_PROMPT.to_string()).expect("agent should load");
+
+        let error = build_eval_suite(
+            &agent,
+            EvalOptions {
+                fixtures_dir: Some(fixture_dir.display().to_string()),
+            },
+        )
+        .expect_err("empty fixture dir should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("No eval fixtures found"));
+    }
+
+    #[test]
+    fn build_eval_suite_reports_passing_and_failing_cases() {
+        let fixture_dir = temp_root("eval-pass-fail");
+        fs::write(
+            fixture_dir.join("a-pass.json"),
+            r#"{
+                "name": "stop passes",
+                "user_input": "",
+                "observations": [],
+                "expected": {
+                    "action": "stop"
+                }
+            }"#,
+        )
+        .expect("fixture should write");
+        fs::write(
+            fixture_dir.join("b-fail.json"),
+            r#"{
+                "name": "retry fails as finish",
+                "user_input": "retry the request",
+                "observations": [
+                    "Recoverable tool failure from `web_search`: timeout"
+                ],
+                "expected": {
+                    "action": "finish"
+                }
+            }"#,
+        )
+        .expect("fixture should write");
+        let agent =
+            MainAgent::from_env(DEFAULT_SYSTEM_PROMPT.to_string()).expect("agent should load");
+
+        let suite = build_eval_suite(
+            &agent,
+            EvalOptions {
+                fixtures_dir: Some(fixture_dir.display().to_string()),
+            },
+        )
+        .expect("suite should build");
+
+        assert_eq!(suite.cases.len(), 2);
+        assert_eq!(suite.passed(), 1);
+        assert_eq!(suite.failed(), 1);
+        assert!(suite.cases[0].passed);
+        assert!(!suite.cases[1].passed);
+        assert_eq!(suite.cases[0].actual.action, "stop");
+        assert_eq!(suite.cases[1].actual.action, "retry");
     }
 }

@@ -38,9 +38,10 @@
   - Files: `docs/memory.md` or equivalent repo-local markdown, `src/mainAgent.rs`
   - Completed: 2026-04-20 — Added `docs/memory.md`, linked it from `AGENTS.md`, and introduced `MemoryLoadRequest` plus source selector hints for future path-scoped memory loading while preserving current behavior.
 
-- [ ] Task 9: Add tests for the eval harness and fixture parsing path (P1)
+- [x] Task 9: Add tests for the eval harness and fixture parsing path (P1)
   - Acceptance: Automated tests cover fixture loading, eval command behavior, and at least one failing-vs-passing planner case.
   - Files: `src/main.rs`, `src/mainAgent.rs`, optional new test module
+  - Completed: 2026-04-20 — Added eval harness tests for empty fixture directories and mixed pass/fail suites, while reusing existing fixture-loading coverage and deterministic planner outcomes.
 
 - [ ] Task 10: Triage and remediate existing Node dependency audit findings used by local tooling (P2)
   - Acceptance: Current `npm audit` findings are either fixed or explicitly documented with bounded rationale and next action.
