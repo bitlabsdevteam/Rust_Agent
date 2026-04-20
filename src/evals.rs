@@ -32,6 +32,8 @@ pub struct PlannerEvalActualDecision {
     pub skill_name: Option<String>,
     pub subagent_name: Option<String>,
     pub reason: String,
+    pub planner_backend: String,
+    pub reasoning: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,17 +200,52 @@ impl PlannerEvalSuiteResult {
                     case.actual.summary()
                 ));
             } else {
+                lines.push(format!("[FAIL] {}", case.fixture.name));
+                lines.push(format!("  input: {}", render_text_block(&case.fixture.user_input)));
                 lines.push(format!(
-                    "[FAIL] {} expected: {} actual: {} reason: {}",
-                    case.fixture.name,
-                    case.fixture.expected.summary(),
-                    case.actual.summary(),
-                    case.actual.reason
+                    "  observations: {}",
+                    render_observations(&case.fixture.observations)
                 ));
+                lines.push(format!("  expected: {}", case.fixture.expected.summary()));
+                lines.push(format!("  actual: {}", case.actual.summary()));
+                lines.push(format!("  reason: {}", case.actual.reason));
+                lines.push(format!(
+                    "  planner backend: {}",
+                    case.actual.planner_backend
+                ));
+                lines.push("  planner reasoning:".to_string());
+                if case.actual.reasoning.is_empty() {
+                    lines.push("  - none recorded".to_string());
+                } else {
+                    for item in &case.actual.reasoning {
+                        lines.push(format!("  - {}", render_text_block(item)));
+                    }
+                }
             }
         }
 
         lines.join("\n")
+    }
+}
+
+fn render_observations(observations: &[String]) -> String {
+    if observations.is_empty() {
+        return "none".to_string();
+    }
+
+    observations
+        .iter()
+        .map(|item| render_text_block(item))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn render_text_block(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "<empty>".to_string()
+    } else {
+        trimmed.replace('\n', " \\n ")
     }
 }
 
@@ -337,6 +374,8 @@ mod tests {
             skill_name: None,
             subagent_name: None,
             reason: "explicit tool request".to_string(),
+            planner_backend: "local heuristic planner".to_string(),
+            reasoning: vec!["Explicit tool request detected.".to_string()],
         };
 
         assert!(expected.matches(&actual));
@@ -363,6 +402,8 @@ mod tests {
                 skill_name: None,
                 subagent_name: None,
                 reason: "explicit tool request".to_string(),
+                planner_backend: "local heuristic planner".to_string(),
+                reasoning: vec!["Explicit tool request detected.".to_string()],
             },
             passed: true,
         };
@@ -374,6 +415,11 @@ mod tests {
                 skill_name: None,
                 subagent_name: Some("general-purpose".to_string()),
                 reason: "default delegation".to_string(),
+                planner_backend: "local heuristic planner".to_string(),
+                reasoning: vec![
+                    "No explicit tool request was inferred.".to_string(),
+                    "No explicit skill request was inferred.".to_string(),
+                ],
             },
             passed: false,
         };
@@ -388,5 +434,9 @@ mod tests {
         assert!(report.contains("[FAIL] tool routing"));
         assert!(report.contains("expected: tool:web_search"));
         assert!(report.contains("actual: delegate:general-purpose"));
+        assert!(report.contains("input: search the web"));
+        assert!(report.contains("planner backend: local heuristic planner"));
+        assert!(report.contains("planner reasoning:"));
+        assert!(report.contains("- No explicit tool request was inferred."));
     }
 }

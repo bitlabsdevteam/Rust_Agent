@@ -28,9 +28,10 @@
   - Files: `evals/fixtures/*`
   - Completed: 2026-04-20 — Added regression fixtures for finish, retry, and empty-input stop, and tightened eval preview handling so harness-owned stop/retry outcomes stay deterministic.
 
-- [ ] Task 7: Make planner and trace outputs easier to inspect in eval results (P1)
+- [x] Task 7: Make planner and trace outputs easier to inspect in eval results (P1)
   - Acceptance: Eval failures show enough structured detail to understand expected vs actual action and the key reasoning context.
   - Files: `src/mainAgent.rs`, optional new eval/reporting module
+  - Completed: 2026-04-20 — Added planner backend and reasoning details to eval preview results and expanded failure rendering with structured input, observation, expected-vs-actual, and planner context lines.
 
 - [ ] Task 8: Add path-scoped memory precedence design notes and a narrow implementation hook (P1)
   - Acceptance: The repo documents intended memory precedence and introduces a small code seam for future path-scoped loading without widening runtime complexity.

@@ -765,6 +765,11 @@ impl MainAgent {
                 skill_name: None,
                 subagent_name: None,
                 reason: "user input was empty".to_string(),
+                planner_backend: self.config.planner_backend.clone(),
+                reasoning: vec![
+                    "The eval preview applies the harness stop condition before planner routing."
+                        .to_string(),
+                ],
             };
         }
         if let Some(observation) = observations.last() {
@@ -778,6 +783,11 @@ impl MainAgent {
                     subagent_name: None,
                     reason: "the latest observation still reflects a recoverable failure"
                         .to_string(),
+                    planner_backend: self.config.planner_backend.clone(),
+                    reasoning: vec![
+                        "The eval preview preserves harness retry semantics from the latest observation."
+                            .to_string(),
+                    ],
                 };
             }
 
@@ -787,12 +797,17 @@ impl MainAgent {
                 skill_name: None,
                 subagent_name: None,
                 reason: "the latest observation is now the best available answer".to_string(),
+                planner_backend: self.config.planner_backend.clone(),
+                reasoning: vec![
+                    "The eval preview finishes when the latest observation already answers the task."
+                        .to_string(),
+                ],
             };
         }
         let state = SessionState::default();
         let task_contract = self.build_task_contract(input, observations);
         let run = self.decide_next_step(&state, input, &task_contract, observations, 0);
-        planner_eval_actual_decision(run.decision)
+        planner_eval_actual_decision(run, &self.config.planner_backend)
     }
 
     fn refresh_project_state(&mut self) -> io::Result<()> {
@@ -2251,8 +2266,11 @@ fn heuristic_plan(
     }
 }
 
-fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision {
-    match decision {
+fn planner_eval_actual_decision(
+    run: PlannerRun,
+    planner_backend: &str,
+) -> PlannerEvalActualDecision {
+    match run.decision {
         Decision::CallTool {
             tool_name, reason, ..
         } => PlannerEvalActualDecision {
@@ -2261,6 +2279,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: None,
             subagent_name: None,
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
         Decision::UseSkill { skill_name, reason } => PlannerEvalActualDecision {
             action: "skill".to_string(),
@@ -2268,6 +2288,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: Some(skill_name),
             subagent_name: None,
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
         Decision::DelegateSubagent {
             subagent_name,
@@ -2278,6 +2300,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: None,
             subagent_name: Some(subagent_name),
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
         Decision::Finish { reason, .. } => PlannerEvalActualDecision {
             action: "finish".to_string(),
@@ -2285,6 +2309,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: None,
             subagent_name: None,
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
         Decision::Retry(reason) => PlannerEvalActualDecision {
             action: "retry".to_string(),
@@ -2292,6 +2318,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: None,
             subagent_name: None,
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
         Decision::Stop(reason) => PlannerEvalActualDecision {
             action: "stop".to_string(),
@@ -2299,6 +2327,8 @@ fn planner_eval_actual_decision(decision: Decision) -> PlannerEvalActualDecision
             skill_name: None,
             subagent_name: None,
             reason,
+            planner_backend: planner_backend.to_string(),
+            reasoning: run.reasoning,
         },
     }
 }
@@ -4574,6 +4604,11 @@ mod tests {
 
         assert_eq!(decision.action, "tool");
         assert_eq!(decision.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(decision.planner_backend, "local heuristic planner");
+        assert!(decision
+            .reasoning
+            .iter()
+            .any(|item| item.contains("web_search")));
     }
 
     #[test]
