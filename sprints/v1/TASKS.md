@@ -13,9 +13,10 @@
   - Files: `docs/cli.md` or equivalent repo-local markdown
   - Completed: 2026-04-20 — Added `docs/cli.md` covering top-level commands, session commands, compaction, and active memory backends, and linked it from `AGENTS.md`.
 
-- [ ] Task 4: Introduce a minimal eval fixture format for planner decisions (P0)
+- [x] Task 4: Introduce a minimal eval fixture format for planner decisions (P0)
   - Acceptance: The repo contains a simple fixture schema that can express user input, observations, and expected planner action.
   - Files: `evals/fixtures/*.json` or `*.jsonl`, `src/mainAgent.rs` or a new eval module
+  - Completed: 2026-04-20 — Added a minimal JSON fixture schema, parser and loader in `src/evals.rs`, plus seed fixtures under `evals/fixtures/`.
 
 - [ ] Task 5: Add a CLI entrypoint to run eval fixtures (P0)
   - Acceptance: A new CLI command runs the eval fixtures and reports pass/fail for expected planner decisions.

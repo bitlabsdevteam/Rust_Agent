@@ -1,0 +1,9 @@
+{
+  "name": "delegation routes planning requests to the plan subagent",
+  "user_input": "plan the implementation for a new eval runner",
+  "observations": [],
+  "expected": {
+    "action": "delegate",
+    "subagent_name": "plan"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "skill routing loads ship-small for explicit skill requests",
+  "user_input": "use skill ship-small to keep this change scoped",
+  "observations": [],
+  "expected": {
+    "action": "skill",
+    "skill_name": "ship-small"
+  }
+}

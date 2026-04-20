@@ -1,0 +1,9 @@
+{
+  "name": "tool routing uses web_search for explicit web queries",
+  "user_input": "search the web for the latest Rust release notes",
+  "observations": [],
+  "expected": {
+    "action": "tool",
+    "tool_name": "web_search"
+  }
+}

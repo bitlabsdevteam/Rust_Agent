@@ -4,6 +4,7 @@ mod Tools;
 mod mcp;
 mod observability;
 mod runtime_log;
+mod evals;
 
 #[allow(non_snake_case)]
 mod mainAgent;
