@@ -43,6 +43,7 @@
   - Files: `src/main.rs`, `src/mainAgent.rs`, optional new test module
   - Completed: 2026-04-20 — Added eval harness tests for empty fixture directories and mixed pass/fail suites, while reusing existing fixture-loading coverage and deterministic planner outcomes.
 
-- [ ] Task 10: Triage and remediate existing Node dependency audit findings used by local tooling (P2)
+- [x] Task 10: Triage and remediate existing Node dependency audit findings used by local tooling (P2)
   - Acceptance: Current `npm audit` findings are either fixed or explicitly documented with bounded rationale and next action.
   - Files: `package.json`, `package-lock.json`, repo-local docs as needed
+  - Completed: 2026-04-20 — Documented that the current `npm audit` findings come from the user’s global npm toolchain, not a repo-owned manifest, and recorded a bounded remediation path in `docs/tooling-audit.md`.
