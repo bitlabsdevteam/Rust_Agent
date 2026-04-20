@@ -1,6 +1,7 @@
 mod web_search_tool_perplexity;
 
 #[cfg(test)]
+#[allow(unused_imports)]
 pub(crate) use web_search_tool_perplexity::{
     extract_web_search_query, format_perplexity_response, PerplexityResponse,
 };
@@ -85,47 +86,9 @@ enum ToolHandler {
 pub fn default_tools() -> Vec<Tool> {
     vec![
         Tool::built_in(
-            "queue_ingress",
-            "Normalize text, image, video, or audio ingress payloads, classify them, and append them to the persistent ingestion queue.",
-            tool_queue_ingress,
-        ),
-        Tool::built_in(
-            "echo",
-            "Return the user request as-is. Useful for simple tool-call flow tests.",
-            tool_echo,
-        ),
-        Tool::built_in(
-            "word_count",
-            "Count how many whitespace-separated words appear in the input.",
-            tool_word_count,
-        ),
-        Tool::built_in(
             "web_search",
             "Run grounded web research through the Perplexity Sonar API and return an answer with citations.",
             tool_web_search_perplexity,
         ),
     ]
-}
-
-fn tool_queue_ingress(user_input: &str, arguments: &Value) -> StepOutcome {
-    match crate::agents::ingress_agent::queue_ingress(user_input, arguments) {
-        Ok(ack) => StepOutcome::Success(ack.render()),
-        Err(reason) => StepOutcome::Retry(format!("Ingress queueing failed: {reason}")),
-    }
-}
-
-fn tool_echo(user_input: &str, arguments: &Value) -> StepOutcome {
-    if let Some(text) = arguments.get("text").and_then(Value::as_str) {
-        return StepOutcome::Success(format!("Echo tool output: {text}"));
-    }
-    StepOutcome::Success(format!("Echo tool output: {user_input}"))
-}
-
-fn tool_word_count(user_input: &str, arguments: &Value) -> StepOutcome {
-    let text = arguments
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or(user_input);
-    let count = text.split_whitespace().count();
-    StepOutcome::Success(format!("Word count tool output: {count}"))
 }

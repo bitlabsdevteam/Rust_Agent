@@ -71,7 +71,12 @@ impl Observability {
         self.tracer.is_some()
     }
 
-    pub fn with_span<T, F>(&self, name: impl Into<Cow<'static, str>>, attributes: Vec<KeyValue>, f: F) -> T
+    pub fn with_span<T, F>(
+        &self,
+        name: impl Into<Cow<'static, str>>,
+        attributes: Vec<KeyValue>,
+        f: F,
+    ) -> T
     where
         F: FnOnce() -> T,
     {
@@ -301,7 +306,12 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     lookup(key)
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -317,7 +327,8 @@ pub fn compact_text(text: &str, max_chars: usize) -> String {
 
 pub fn kv_json(key: impl Into<String>, value: &impl serde::Serialize) -> KeyValue {
     let key = key.into();
-    let serialized = serde_json::to_string(value).unwrap_or_else(|_| "\"<unserializable>\"".to_string());
+    let serialized =
+        serde_json::to_string(value).unwrap_or_else(|_| "\"<unserializable>\"".to_string());
     KeyValue::new(key, compact_text(&serialized, 4_000))
 }
 
@@ -377,7 +388,9 @@ mod tests {
             "https://example.langfuse.com/api/public/otel/v1/traces"
         );
         assert_eq!(
-            config.targets[0].headers.get("x-langfuse-ingestion-version"),
+            config.targets[0]
+                .headers
+                .get("x-langfuse-ingestion-version"),
             Some(&LANGFUSE_INGESTION_VERSION.to_string())
         );
         assert_eq!(

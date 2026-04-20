@@ -26,6 +26,27 @@ Humans steer. Agents execute.
 - prefer progressive disclosure over one giant instruction blob
 - if the project grows, move detailed architecture, product, reliability, and security guidance into `docs/` and keep this file as the map to those sources
 
+## External AI Agent Reference
+
+For any task involving building, designing, reviewing, or extending AI agents, consult this vault before proposing architecture or making implementation decisions:
+
+- `/Users/davidbong/Documents/my_second_brain_vault/AGENTS.md`
+- `/Users/davidbong/Documents/my_second_brain_vault/index.md`
+- relevant pages under `/Users/davidbong/Documents/my_second_brain_vault/wiki/`
+
+Required workflow for AI agent work:
+
+1. read the vault `AGENTS.md`
+2. read the vault `index.md`
+3. open the most relevant wiki pages for the task
+4. use the vault wiki as the standing reference for agent patterns, context engineering, workflows, and design tradeoffs
+5. then apply repository-local constraints and implementation details from this repo
+
+Priority rule:
+
+- repo-local files remain the source of truth for this repository's code, behavior, and constraints
+- the vault is the required reference for general AI agent building guidance and reusable design patterns
+
 ## Production Standard
 
 ### 1. Context Engineering Standard
@@ -38,6 +59,7 @@ Humans steer. Agents execute.
 - keep role, policy, and non-negotiable behavior in the system prompt
 - keep task-specific state in structured runtime context, not buried in prose
 - prefer retrieval and selective loading of repo documents over dumping everything into one prompt
+- for AI agent tasks, load the external vault entrypoints and relevant wiki pages before finalizing the working context
 - summarize or compact old context when the working set grows, but never drop active constraints silently
 - keep tool results, observations, retries, and open questions explicit between loop iterations
 - treat repository-local, versioned knowledge as the source of truth; knowledge in chat threads or human memory does not count until written into the repo
@@ -183,6 +205,7 @@ Minimum eval categories for this template:
 
 - important decisions should live in repo-local markdown or code, not only in conversation
 - design rules should be explicit enough that an agent can discover and follow them
+- for AI agent architecture and workflow guidance, the external vault at `/Users/davidbong/Documents/my_second_brain_vault` is a required reference and should be checked first
 - if the repo grows, split durable knowledge into focused files such as architecture, product, reliability, and security references
 - keep documentation fresh enough that it can be trusted by an agent
 
@@ -192,22 +215,22 @@ The current Rust scaffold implements:
 
 - a minimal CLI in `src/main.rs`
 - a documented model policy with default `OpenAI GPT-5.4` and fallback `Opus 4.6`
-- a ReAct-style loop with tool, skill, retry, and stop handling
-- a hard retry cap of 3
-- example tools: `echo`, `word_count`
-- example skills: `summarize`, `retry_once`
-- execution trace output for debugging loop behavior
-- an optional OpenAI-backed planner path with heuristic fallback when no API key is loaded
+- a Claude-style interactive session runtime instead of the old ingress queue demo
+- project memory loading from `CLAUDE.md` plus imported `@path` files
+- project and user subagent discovery from `.claude/agents/*.md`
+- project and user slash-command discovery from `.claude/commands/*.md`
+- isolated subagent delegation with compact context packets and structured handoffs
+- MCP tool loading plus grounded `web_search` support
+- execution trace output and OpenTelemetry-based observability for session, tool, and subagent behavior
 
 ## Near-Term Production Upgrades
 
 Good next steps from this template:
 
-- replace heuristic planning with a fully model-backed planner interface
-- move tool and skill inputs to structured schemas
-- add explicit observation parsing between loop iterations
-- add context compaction and long-history management
-- add persistent memory only after the base loop is stable
+- replace heuristic delegation with a fully model-backed planner interface
+- add richer memory precedence and deeper path-scoped project memory
+- move command and subagent frontmatter parsing from simple strings to structured schemas
+- add stronger context compaction and longer-session history management
 - add external tool adapters with validation and timeout policies
 - add an eval harness with regression fixtures
 - split durable design knowledge into a repo-local `docs/` structure once the project outgrows this file

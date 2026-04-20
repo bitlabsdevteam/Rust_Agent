@@ -1,422 +1,489 @@
-use crate::agents::{ingress_agent, planner_agent, retry_once_agent, summarize_agent};
 use crate::mcp::{load_mcp_catalog_from_env, McpServerSummary};
 use crate::observability::{self, Observability};
-use crate::runtime_log;
 use crate::Tools::{default_tools, Tool};
 use opentelemetry::KeyValue;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const EXIT_COMMANDS: &[&str] = &["exit", "quit", ":q"];
-const MAX_RETRIES: u8 = 3;
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are the ingress and data ingestion agent. Accept incoming text, image, video, and audio payloads, normalize them, classify them, and queue them for downstream processing.";
-const DEFAULT_MODEL: &str = "OpenAI GPT-5.4";
-const FALLBACK_MODEL: &str = "Opus 4.6";
+pub const DEFAULT_SYSTEM_PROMPT: &str =
+    "You are a harness-first coding agent. Start from an explicit task contract, load project memory before acting, take exactly one action per loop iteration, keep context compact, and make tools, delegation, retries, and stop conditions legible in the trace.";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.4";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1/responses";
 pub const DEFAULT_PERPLEXITY_MODEL: &str = "sonar-pro";
-const SKILLS_DIR: &str = "skills";
-const SKILL_FILE_NAME: &str = "SKILL.md";
-const WORKSPACE_CONTEXT_DIR: &str = "Workspace";
-const REPO_CONTEXT_FILES: &[&str] = &["AGENTS.md", "TDD.md"];
-const MAX_COMPACT_CONTEXT_DOC_CHARS: usize = 280;
-const MAX_COMPACT_CONTEXT_HISTORY_MESSAGES: usize = 8;
-const DEFAULT_QUEUE_POLL_INTERVAL_MS: u64 = 1000;
+
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1/responses";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1/messages";
+const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+const FALLBACK_MODEL: &str = "Opus 4.6";
+const MAX_RETRIES: u8 = 3;
+const MAX_LOOP_STEPS: u8 = 8;
+const MAX_IMPORT_DEPTH: usize = 5;
+const MAX_TRACE_ENTRIES: usize = 24;
+const MAX_COMPACTED_HISTORY_ITEMS: usize = 6;
+const MAX_RELEVANT_FILES: usize = 5;
+const PROJECT_MEMORY_FILE: &str = "CLAUDE.md";
+const CLAUDE_DIR: &str = ".claude";
+const AGENTS_DIR: &str = "agents";
+const COMMANDS_DIR: &str = "commands";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepOutcome {
+    Success(String),
+    Retry(String),
+}
+
+impl fmt::Display for StepOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success(output) => write!(f, "success: {output}"),
+            Self::Retry(reason) => write!(f, "retry: {reason}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentResult {
+    pub output: String,
+    pub trace: Vec<String>,
+    pub usage: Vec<TokenUsageRecord>,
+    pub stopped: bool,
+}
+
+impl AgentResult {
+    fn completed(output: String, trace: Vec<String>, usage: Vec<TokenUsageRecord>) -> Self {
+        Self {
+            output,
+            trace,
+            usage,
+            stopped: false,
+        }
+    }
+
+    fn stopped(
+        output: impl Into<String>,
+        trace: Vec<String>,
+        usage: Vec<TokenUsageRecord>,
+    ) -> Self {
+        Self {
+            output: output.into(),
+            trace,
+            usage,
+            stopped: true,
+        }
+    }
+
+    pub fn render_usage_summary(&self) -> String {
+        render_usage_summary(&self.usage)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct AgentConfig {
     system_prompt: String,
-    max_retries: u8,
     default_model: &'static str,
     fallback_model: &'static str,
-    planner_model: Option<String>,
+    planner_backend: String,
+    max_retries: u8,
 }
 
-#[derive(Debug, Clone)]
-struct AgentState {
-    retries: u8,
-    trace: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MessageRole {
+    User,
+    Assistant,
 }
 
-impl AgentState {
-    fn new() -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConversationMessage {
+    role: MessageRole,
+    content: String,
+}
+
+impl ConversationMessage {
+    fn user(content: impl Into<String>) -> Self {
         Self {
-            retries: 0,
-            trace: Vec::new(),
+            role: MessageRole::User,
+            content: content.into(),
         }
     }
 
-    fn record(&mut self, message: impl Into<String>) {
-        self.trace.push(message.into());
-    }
-
-    fn recent_trace(&self, max_entries: usize) -> String {
-        let total = self.trace.len();
-        let start = total.saturating_sub(max_entries);
-        self.trace[start..].join("\n")
+    fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+        }
     }
 }
 
-pub struct MainAgent {
-    config: AgentConfig,
-    tools: Vec<Tool>,
-    skills: Vec<Skill>,
-    skill_catalog_warnings: Vec<String>,
-    mcp_servers: Vec<McpServerSummary>,
-    llm_engine: Option<OpenAiEngine>,
-    observability: Observability,
+#[derive(Debug, Default, Clone)]
+struct SessionState {
+    history: Vec<ConversationMessage>,
+    trace: Vec<String>,
+    compacted_summary: Option<String>,
+    observations: Vec<String>,
 }
 
+impl SessionState {
+    fn record(&mut self, entry: impl Into<String>) {
+        self.trace.push(entry.into());
+        if self.trace.len() > MAX_TRACE_ENTRIES {
+            let remove_count = self.trace.len() - MAX_TRACE_ENTRIES;
+            self.trace.drain(0..remove_count);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.history.clear();
+        self.trace.clear();
+        self.compacted_summary = None;
+        self.observations.clear();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitModeConfig {
     pub prompt_label: String,
-    pub agent_name: String,
-    pub agent_icon: String,
-    pub user_name: String,
     pub show_trace: bool,
     pub bin_name: String,
 }
 
-pub struct QueueModeConfig {
-    pub agent_name: String,
-    pub agent_icon: String,
-    pub show_trace: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MemoryScope {
+    User,
+    Project,
+    Imported,
 }
 
-enum QueueInputEvent {
-    Line(String),
-    Eof,
-    Error(String),
+impl fmt::Display for MemoryScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Imported => "imported",
+        };
+        write!(f, "{label}")
+    }
 }
 
-pub trait StreamObserver {
-    fn on_reasoning_delta(&mut self, _delta: &str) {}
-
-    fn on_reasoning_done(&mut self, _text: &str) {}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySource {
+    pub scope: String,
+    pub path: PathBuf,
+    pub contents: String,
+    pub imported_from: Option<PathBuf>,
 }
 
-pub struct TerminalReasoningStreamer {
-    line_open: bool,
-    emitted_any: bool,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryStack {
+    pub sources: Vec<MemorySource>,
+    pub merged_instructions: String,
 }
 
-impl TerminalReasoningStreamer {
-    pub fn new() -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPacket {
+    pub goal: String,
+    pub constraints: Vec<String>,
+    pub relevant_files: Vec<String>,
+    pub known_facts: Vec<String>,
+    pub missing_facts: Vec<String>,
+    pub next_action: String,
+    pub stop_condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskContract {
+    goal: String,
+    constraints: Vec<String>,
+    acceptance_criteria: Vec<String>,
+    relevant_files: Vec<String>,
+    stop_condition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefinitionScope {
+    User,
+    Project,
+}
+
+impl fmt::Display for DefinitionScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::User => "user",
+            Self::Project => "project",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSpec {
+    pub name: String,
+    pub description: String,
+    pub prompt: String,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub scope: String,
+    pub source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationRequest {
+    pub subagent: String,
+    pub context_packet: ContextPacket,
+    pub memory_refs: Vec<String>,
+    pub file_refs: Vec<String>,
+    pub observations: Vec<String>,
+    pub task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationResult {
+    pub summary: String,
+    pub findings: Vec<String>,
+    pub artifact_refs: Vec<String>,
+    pub recommended_next_action: String,
+    pub final_text: String,
+    pub usage: Vec<TokenUsageRecord>,
+}
+
+impl DelegationResult {
+    fn render(&self) -> String {
+        let findings = if self.findings.is_empty() {
+            "- none".to_string()
+        } else {
+            self.findings
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let artifacts = if self.artifact_refs.is_empty() {
+            "- none".to_string()
+        } else {
+            self.artifact_refs
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "{}\n\nFindings:\n{}\n\nArtifacts:\n{}\n\nNext action: {}",
+            self.final_text, findings, artifacts, self.recommended_next_action
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsageRecord {
+    pub actor: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+    pub execution: String,
+    pub note: String,
+}
+
+impl TokenUsageRecord {
+    fn zero(
+        actor: impl Into<String>,
+        execution: impl Into<String>,
+        note: impl Into<String>,
+    ) -> Self {
         Self {
-            line_open: false,
-            emitted_any: false,
+            actor: actor.into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            execution: execution.into(),
+            note: note.into(),
         }
     }
 
-    pub fn emitted_any(&self) -> bool {
-        self.emitted_any
+    fn trace_line(&self) -> String {
+        format!(
+            "{}: {} input / {} output / {} total ({})",
+            self.actor, self.input_tokens, self.output_tokens, self.total_tokens, self.note
+        )
     }
 
-    pub fn finish(&mut self) {
-        if self.line_open {
-            println!();
-            self.line_open = false;
+    fn summary_line(&self) -> String {
+        format!(
+            "- {}: {} input, {} output, {} total [{}; {}]",
+            self.actor,
+            self.input_tokens,
+            self.output_tokens,
+            self.total_tokens,
+            self.execution,
+            self.note
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CustomCommand {
+    name: String,
+    description: String,
+    template: String,
+    source_path: PathBuf,
+    scope: DefinitionScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decision {
+    CallTool {
+        tool_name: String,
+        arguments: Value,
+        reason: String,
+    },
+    DelegateSubagent {
+        subagent_name: String,
+        reason: String,
+    },
+    Finish {
+        answer: String,
+        reason: String,
+    },
+    Retry(String),
+    Stop(String),
+}
+
+impl fmt::Display for Decision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CallTool {
+                tool_name, reason, ..
+            } => write!(f, "call tool `{tool_name}` ({reason})"),
+            Self::DelegateSubagent {
+                subagent_name,
+                reason,
+            } => write!(f, "delegate to subagent `{subagent_name}` ({reason})"),
+            Self::Finish { answer, reason } => write!(f, "finish ({reason}; {answer})"),
+            Self::Retry(reason) => write!(f, "retry ({reason})"),
+            Self::Stop(reason) => write!(f, "stop ({reason})"),
         }
     }
 }
 
-impl StreamObserver for TerminalReasoningStreamer {
-    fn on_reasoning_delta(&mut self, delta: &str) {
-        if delta.is_empty() {
-            return;
-        }
+#[derive(Debug, Clone)]
+struct PlannerRun {
+    decision: Decision,
+    reasoning: Vec<String>,
+    usage: Option<TokenUsageRecord>,
+}
 
-        if !self.line_open {
-            print!("Reasoning: ");
-            self.line_open = true;
-            self.emitted_any = true;
-        }
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashCommand {
+    Help,
+    Agents,
+    Memory,
+    Model,
+    Clear,
+    Compact,
+    Mcp,
+    Review(String),
+    Init,
+    Agent { name: String, task: String },
+    Exit,
+    Custom { name: String, arguments: String },
+    Unknown(String),
+}
 
-        print!("{delta}");
-        let _ = io::stdout().flush();
-    }
-
-    fn on_reasoning_done(&mut self, _text: &str) {
-        self.finish();
-    }
+pub struct MainAgent {
+    root_dir: PathBuf,
+    home_dir: Option<PathBuf>,
+    config: AgentConfig,
+    llm_engine: Option<OpenAiEngine>,
+    fallback_engine: Option<AnthropicEngine>,
+    tools: Vec<Tool>,
+    mcp_servers: Vec<McpServerSummary>,
+    observability: Observability,
+    memory_stack: MemoryStack,
+    subagents: BTreeMap<String, SubagentSpec>,
+    commands: BTreeMap<String, CustomCommand>,
 }
 
 impl MainAgent {
-    #[cfg(test)]
-    fn new(system_prompt: String) -> Self {
-        Self::with_engine(system_prompt, None, default_tools(), Vec::new())
-    }
-
     pub fn from_env(system_prompt: String) -> io::Result<Self> {
         let catalog = load_mcp_catalog_from_env()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         let mut tools = default_tools();
         tools.extend(catalog.tools.into_iter().map(Tool::from_mcp));
-        Ok(Self::with_engine(
-            system_prompt,
-            OpenAiEngine::from_env(),
-            tools,
-            catalog.servers,
-        ))
-    }
+        let llm_engine = OpenAiEngine::from_env();
+        let fallback_engine = AnthropicEngine::from_env();
 
-    fn with_engine(
-        system_prompt: String,
-        llm_engine: Option<OpenAiEngine>,
-        tools: Vec<Tool>,
-        mcp_servers: Vec<McpServerSummary>,
-    ) -> Self {
-        let (skills, skill_catalog_warnings) = load_skill_catalog_from_dir(Path::new(SKILLS_DIR));
-        Self {
+        let planner_backend = match (&llm_engine, &fallback_engine) {
+            (Some(primary), Some(fallback)) => format!(
+                "OpenAI Responses planner ({}) -> Anthropic planner ({}) -> local heuristic router",
+                primary.model, fallback.model
+            ),
+            (Some(primary), None) => format!(
+                "OpenAI Responses planner ({}) -> local heuristic router",
+                primary.model
+            ),
+            (None, Some(fallback)) => format!(
+                "Anthropic planner ({}) -> local heuristic router",
+                fallback.model
+            ),
+            (None, None) => "local heuristic planner".to_string(),
+        };
+
+        let mut agent = Self {
+            root_dir: env::current_dir()?,
+            home_dir: env::var("HOME").ok().map(PathBuf::from),
             config: AgentConfig {
                 system_prompt,
-                max_retries: MAX_RETRIES,
-                default_model: DEFAULT_MODEL,
+                default_model: "OpenAI GPT-5.4",
                 fallback_model: FALLBACK_MODEL,
-                planner_model: llm_engine.as_ref().map(|engine| engine.model.clone()),
+                planner_backend,
+                max_retries: MAX_RETRIES,
             },
-            tools,
-            skills,
-            skill_catalog_warnings,
-            mcp_servers,
             llm_engine,
+            fallback_engine,
+            tools,
+            mcp_servers: catalog.servers,
             observability: Observability::from_env(),
-        }
+            memory_stack: MemoryStack::default(),
+            subagents: BTreeMap::new(),
+            commands: BTreeMap::new(),
+        };
+        agent.refresh_project_state()?;
+        Ok(agent)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn run(&self, user_input: &str) -> AgentResult {
-        self.run_with_history(&[], user_input)
+    pub fn init_project_files(&mut self) -> io::Result<Vec<PathBuf>> {
+        let created = scaffold_claude_project(&self.root_dir)?;
+        self.refresh_project_state()?;
+        Ok(created)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn run_with_history(
-        &self,
-        history: &[ConversationMessage],
-        user_input: &str,
-    ) -> AgentResult {
-        self.run_with_history_and_observer(history, user_input, None)
+    fn refresh_project_state(&mut self) -> io::Result<()> {
+        self.memory_stack = load_memory_stack(&self.root_dir, self.home_dir.as_deref())?;
+        self.subagents = load_subagent_specs(&self.root_dir, self.home_dir.as_deref())?;
+        self.commands = load_custom_commands(&self.root_dir, self.home_dir.as_deref())?;
+        Ok(())
     }
 
-    pub fn run_with_history_and_observer(
-        &self,
-        history: &[ConversationMessage],
-        user_input: &str,
-        mut observer: Option<&mut dyn StreamObserver>,
-    ) -> AgentResult {
-        self.observability.with_span(
-            "main_agent.run",
-            build_root_span_attributes(&self.config, history, user_input, self.observability.enabled_targets()),
-            || {
-                let mut state = AgentState::new();
-                state.record(format!(
-                    "Model policy loaded: default=`{}`, fallback=`{}`",
-                    self.config.default_model, self.config.fallback_model
-                ));
-                if let Some(engine) = &self.llm_engine {
-                    state.record(format!(
-                        "Planner backend: OpenAI Responses API model=`{}`",
-                        engine.model
-                    ));
-                } else {
-                    state.record("Planner backend: local heuristic (no OpenAI API key loaded)");
-                }
-                state.record(format!(
-                    "System prompt loaded: {}",
-                    self.config.system_prompt
-                ));
-                state.record(format!("Registered tools: {}", self.tools.len()));
-                state.record(format!("Registered skills: {}", self.skills.len()));
-                if self.observability.is_enabled() {
-                    state.record(format!(
-                        "Observability exporters: {}",
-                        self.observability.enabled_targets().join(", ")
-                    ));
-                    if let Some(trace_id) = Observability::active_trace_id() {
-                        state.record(format!("Trace ID: {trace_id}"));
-                    }
-                }
-                for warning in &self.skill_catalog_warnings {
-                    state.record(format!("Skill catalog warning: {warning}"));
-                }
-                for warning in self.observability.warnings() {
-                    state.record(format!("Observability warning: {warning}"));
-                }
-                if !self.mcp_servers.is_empty() {
-                    state.record(format!("Loaded MCP servers: {}", self.mcp_servers.len()));
-                }
-                state.record(format!("History items loaded: {}", history.len()));
-                state.record(format!("User input received: {user_input}"));
-
-                loop {
-                    let planner_run = self.decide_next_step(
-                        history,
-                        &state,
-                        user_input,
-                        reborrow_observer(&mut observer),
-                    );
-                    let decision = planner_run.decision;
-                    state.record(format!("Decision: {}", decision));
-                    record_reasoning_summary(
-                        &mut state,
-                        &self.config,
-                        &decision,
-                        &planner_run.reasoning,
-                    );
-                    record_decision_event(&decision, &planner_run.reasoning);
-
-                    match decision {
-                        Decision::CallTool {
-                            tool_name,
-                            arguments,
-                            ..
-                        } => {
-                            let outcome = self.call_tool(&tool_name, user_input, &arguments);
-                            state.record(format!("Tool outcome: {}", outcome));
-                            match outcome {
-                                StepOutcome::Success(output) => {
-                                    Observability::set_attributes(vec![KeyValue::new(
-                                        "output.value",
-                                        observability::compact_text(&output, 4_000),
-                                    )]);
-                                    Observability::set_status_ok();
-                                    return AgentResult::completed(output, state.trace);
-                                }
-                                StepOutcome::Retry(reason) => {
-                                    Observability::record_event(
-                                        "agent.retry",
-                                        vec![KeyValue::new("retry.reason", reason.clone())],
-                                    );
-                                    if should_stop_after_retry(
-                                        &mut state,
-                                        self.config.max_retries,
-                                        &reason,
-                                    ) {
-                                        Observability::set_status_error(reason);
-                                        return AgentResult::stopped(state.trace);
-                                    }
-                                }
-                            }
-                        }
-                        Decision::CallSkill(skill_name, _) => {
-                            let outcome = self.call_skill(&skill_name, history, user_input, &mut state);
-                            state.record(format!("Skill outcome: {}", outcome));
-                            match outcome {
-                                StepOutcome::Success(output) => {
-                                    Observability::set_attributes(vec![KeyValue::new(
-                                        "output.value",
-                                        observability::compact_text(&output, 4_000),
-                                    )]);
-                                    Observability::set_status_ok();
-                                    return AgentResult::completed(output, state.trace);
-                                }
-                                StepOutcome::Retry(reason) => {
-                                    Observability::record_event(
-                                        "agent.retry",
-                                        vec![KeyValue::new("retry.reason", reason.clone())],
-                                    );
-                                    if should_stop_after_retry(
-                                        &mut state,
-                                        self.config.max_retries,
-                                        &reason,
-                                    ) {
-                                        Observability::set_status_error(reason);
-                                        return AgentResult::stopped(state.trace);
-                                    }
-                                }
-                            }
-                        }
-                        Decision::Retry(reason) => {
-                            state.record(format!("Planner requested retry: {reason}"));
-                            Observability::record_event(
-                                "planner.retry",
-                                vec![KeyValue::new("retry.reason", reason.clone())],
-                            );
-                            if should_stop_after_retry(&mut state, self.config.max_retries, &reason) {
-                                Observability::set_status_error(reason);
-                                return AgentResult::stopped(state.trace);
-                            }
-                        }
-                        Decision::Finish(answer, _) => {
-                            state.record("Stop condition met: planner produced final answer.");
-                            Observability::set_attributes(vec![KeyValue::new(
-                                "output.value",
-                                observability::compact_text(&answer, 4_000),
-                            )]);
-                            Observability::set_status_ok();
-                            return AgentResult::completed(answer, state.trace);
-                        }
-                        Decision::Stop(reason) => {
-                            state.record(format!("Stop condition met: {reason}"));
-                            Observability::set_status_error(reason);
-                            return AgentResult::stopped(state.trace);
-                        }
-                    }
-                }
-            },
-        )
-    }
-
-    pub fn system_prompt(&self) -> &str {
-        &self.config.system_prompt
-    }
-
-    pub fn default_model(&self) -> &str {
-        self.config.default_model
-    }
-
-    pub fn fallback_model(&self) -> &str {
-        self.config.fallback_model
-    }
-
-    pub fn planner_backend_label(&self) -> String {
-        match &self.llm_engine {
-            Some(engine) => format!("OpenAI Responses API ({})", engine.model),
-            None => "local heuristic".to_string(),
-        }
-    }
-
-    pub fn tools(&self) -> &[Tool] {
-        &self.tools
-    }
-
-    pub fn skills(&self) -> &[Skill] {
-        &self.skills
-    }
-
-    pub fn mcp_servers(&self) -> &[McpServerSummary] {
-        &self.mcp_servers
-    }
-
-    pub fn wait_for_context(&self, config: WaitModeConfig) -> io::Result<()> {
+    pub fn wait_for_context(&mut self, config: WaitModeConfig) -> io::Result<()> {
         let mut show_trace = config.show_trace;
-        let mut history: Vec<ConversationMessage> = Vec::new();
-        if let Err(reason) = ingress_agent::ensure_conversation_history_file() {
-            eprintln!("Conversation history setup failed: {reason}");
-        }
+        let mut state = SessionState::default();
 
-        println!("{} {} CLI", config.agent_icon, config.agent_name);
-        println!("Welcome, {}.", config.user_name);
+        println!("Claude-style session");
         println!(
             "Default model: {} | Fallback model: {}",
             self.default_model(),
             self.fallback_model()
         );
         println!("Planner backend: {}", self.planner_backend_label());
-        println!("{}", chat_help_text(&config.bin_name));
+        println!("{}", self.chat_help_text(&config.bin_name));
 
         let stdin = io::stdin();
         loop {
-            print!("\n{} {}> ", config.agent_icon, config.prompt_label);
+            print!("{}> ", config.prompt_label);
             io::stdout().flush()?;
 
             let mut buffer = String::new();
@@ -428,58 +495,36 @@ impl MainAgent {
 
             let input = buffer.trim();
             if input.is_empty() {
-                println!("Waiting for context. Enter a message or use /help.");
                 continue;
             }
 
-            match input {
-                "/help" => println!("{}", chat_help_text(&config.bin_name)),
-                "/system" => println!("System prompt: {}", self.system_prompt()),
-                "/tools" => {
-                    println!("Tools:");
-                    for tool in self.tools() {
-                        println!("- {}: {}", tool.name(), tool.description());
+            if input.starts_with('/') {
+                match self.handle_slash_command(&mut state, input, &config.bin_name)? {
+                    CommandOutcome::Continue(output) => {
+                        println!("{output}");
+                    }
+                    CommandOutcome::Exit(output) => {
+                        println!("{output}");
+                        break;
+                    }
+                    CommandOutcome::ToggleTrace => {
+                        show_trace = !show_trace;
+                        println!(
+                            "Trace output is now {}.",
+                            if show_trace { "on" } else { "off" }
+                        );
                     }
                 }
-                "/skills" => {
-                    println!("Skills:");
-                    for skill in self.skills() {
-                        println!("- {}: {}", skill.name(), skill.description());
-                    }
-                }
-                "/trace" => {
-                    show_trace = !show_trace;
-                    println!(
-                        "Trace output is now {}.",
-                        if show_trace { "on" } else { "off" }
-                    );
-                }
-                "/exit" => {
-                    println!("Session ended.");
-                    break;
-                }
-                other if EXIT_COMMANDS.contains(&other) => {
-                    println!("Session ended.");
-                    break;
-                }
-                message => {
-                    let mut streamer = TerminalReasoningStreamer::new();
-                    let result =
-                        self.run_with_history_and_observer(&history, message, Some(&mut streamer));
-                    streamer.finish();
-                    print_run_result(&result, show_trace, !streamer.emitted_any());
+                continue;
+            }
 
-                    history.push(ConversationMessage::user(message));
-                    history.push(ConversationMessage::assistant(result.output.clone()));
-                    if let Err(reason) = ingress_agent::append_conversation_history("user", message)
-                    {
-                        eprintln!("Conversation history update failed: {reason}");
-                    }
-                    if let Err(reason) =
-                        ingress_agent::append_conversation_history("assistant", &result.output)
-                    {
-                        eprintln!("Conversation history update failed: {reason}");
-                    }
+            let result = self.run_with_state(&mut state, input);
+            println!("{}", result.output);
+            println!("\n{}", result.render_usage_summary());
+            if show_trace {
+                println!("\nTrace:");
+                for entry in &result.trace {
+                    println!("- {entry}");
                 }
             }
         }
@@ -487,1132 +532,1033 @@ impl MainAgent {
         Ok(())
     }
 
-    pub fn wait_for_queue(
-        &self,
-        config: QueueModeConfig,
-        bootstrap_input: Option<&str>,
-    ) -> io::Result<()> {
-        let stdin_is_terminal = io::stdin().is_terminal();
-        let queue_path = ingress_agent::resolve_queue_path();
-        let planner_queue_path = planner_agent::resolve_planner_queue_path();
-        if let Err(reason) = ingress_agent::ensure_conversation_history_file() {
-            eprintln!("Conversation history setup failed: {reason}");
-        }
-
-        println!("{} {} Ingress Runner", config.agent_icon, config.agent_name);
-        println!(
-            "Default model: {} | Fallback model: {}",
-            self.default_model(),
-            self.fallback_model()
-        );
-        println!("Planner backend: {}", self.planner_backend_label());
-        println!("Ingress queue file: {}", queue_path.display());
-        println!("Planner queue file: {}", planner_queue_path.display());
-        println!("Active agents:");
-        for label in self.registered_queue_agent_labels() {
-            let status = if label == "planner_agent" {
-                "waiting for ingress queue"
-            } else {
-                "waiting for user input"
-            };
-            println!("- {label}: {status}");
-        }
-        println!("Enter inbound payloads. Type `exit`, `quit`, or `:q` to stop.");
-        println!(
-            "Planner poll interval: {} ms",
-            resolve_queue_poll_interval().as_millis()
-        );
-        runtime_log::info(
-            "main_agent",
-            format!(
-                "started agents: {}",
-                self.registered_queue_agent_labels().join(", ")
-            ),
-        );
-        runtime_log::info(
-            "planner_agent",
-            format!(
-                "watching ingress queue {} with planner queue {}",
-                queue_path.display(),
-                planner_queue_path.display()
-            ),
-        );
-
-        if let Some(input) = bootstrap_input
-            .map(str::trim)
-            .filter(|input| !input.is_empty())
-        {
-            self.process_ingress_submission(input, config.show_trace, true);
-        }
-        let input_events = Some(spawn_queue_input_reader());
-        self.watch_ingress_queue_forever(&config, stdin_is_terminal, input_events)
+    pub fn run(&self, input: &str) -> AgentResult {
+        let mut state = SessionState::default();
+        self.run_with_state(&mut state, input)
     }
 
-    fn watch_ingress_queue_forever(
-        &self,
-        config: &QueueModeConfig,
-        stdin_is_terminal: bool,
-        mut input_events: Option<mpsc::Receiver<QueueInputEvent>>,
-    ) -> io::Result<()> {
-        let poll_interval = resolve_queue_poll_interval();
-        let mut prompt_visible = false;
-        let _ = self.process_pending_queue_work(config.show_trace);
-
-        loop {
-            if stdin_is_terminal && !prompt_visible {
-                print!("\n{} ingress> ", config.agent_icon);
-                io::stdout().flush()?;
-                prompt_visible = true;
-            }
-
-            let queue_event = match &input_events {
-                Some(receiver) => receiver.recv_timeout(poll_interval),
-                None => {
-                    thread::sleep(poll_interval);
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                }
-            };
-
-            match queue_event {
-                Ok(QueueInputEvent::Line(buffer)) => {
-                    prompt_visible = false;
-                    let input = buffer.trim();
-                    if input.is_empty() {
-                        println!("Waiting for user input.");
-                        continue;
-                    }
-                    if EXIT_COMMANDS.contains(&input) {
-                        println!("Ingress runner ended.");
-                        break;
-                    }
-
-                    self.process_ingress_submission(input, config.show_trace, false);
-                }
-                Ok(QueueInputEvent::Eof) => {
-                    if should_continue_polling_after_stdin_close(stdin_is_terminal) {
-                        input_events = None;
-                        prompt_visible = false;
-                        println!("\nStdin closed. Continuing planner queue polling.");
-                        runtime_log::warn(
-                            "main_agent",
-                            "stdin closed; continuing planner queue watcher",
-                        );
-                    } else {
-                        println!("\nIngress runner ended.");
-                        runtime_log::info("main_agent", "ingress runner stopped after stdin close");
-                        break;
-                    }
-                }
-                Ok(QueueInputEvent::Error(reason)) => {
-                    runtime_log::error(
-                        "main_agent",
-                        format!("stdin reader failed while watching ingress queue: {reason}"),
+    fn run_with_state(&self, state: &mut SessionState, input: &str) -> AgentResult {
+        self.observability.with_span(
+            "main_agent.run",
+            vec![
+                KeyValue::new("planner.backend", self.config.planner_backend.clone()),
+                KeyValue::new("models.default", self.config.default_model.to_string()),
+                KeyValue::new("models.fallback", self.config.fallback_model.to_string()),
+                KeyValue::new("input.preview", observability::compact_text(input, 512)),
+            ],
+            || {
+                if input.trim().is_empty() {
+                    return AgentResult::stopped(
+                        "Empty input. Nothing to do.",
+                        vec!["Stop condition met: user input was empty.".to_string()],
+                        vec![TokenUsageRecord::zero(
+                            "main agent request",
+                            "no-op",
+                            "empty input; no model API call",
+                        )],
                     );
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to read stdin: {reason}"),
+                }
+
+                let mut trace = vec![
+                    format!(
+                        "Loaded {} memory source(s).",
+                        self.memory_stack.sources.len()
+                    ),
+                    format!("Loaded {} subagent spec(s).", self.subagents.len()),
+                    format!("Loaded {} custom command(s).", self.commands.len()),
+                ];
+                if let Some(summary) = &state.compacted_summary {
+                    trace.push(format!(
+                        "Compacted session summary is active: {}",
+                        observability::compact_text(summary, 220)
                     ));
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if self.process_pending_queue_work(config.show_trace) {
-                        prompt_visible = false;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if should_continue_polling_after_stdin_close(stdin_is_terminal) {
-                        input_events = None;
-                        prompt_visible = false;
-                        println!("\nInput reader disconnected. Continuing planner queue polling.");
-                        runtime_log::warn(
-                            "main_agent",
-                            "input reader disconnected; continuing planner queue watcher",
-                        );
-                    } else {
-                        println!("\nIngress runner ended.");
-                        runtime_log::info(
-                            "main_agent",
-                            "ingress runner stopped after input reader disconnect",
-                        );
-                        break;
-                    }
-                }
-            }
-        }
+                trace.push(format!(
+                    "User input received: {}",
+                    observability::compact_text(input, 240)
+                ));
+                let mut usage = Vec::new();
+                let mut retry_count = 0u8;
+                let mut step_count = 0u8;
+                let mut observations = state.observations.clone();
 
-        Ok(())
+                loop {
+                    if step_count >= MAX_LOOP_STEPS {
+                        let reason = format!(
+                            "Stop condition met: loop reached {MAX_LOOP_STEPS} steps without a final answer."
+                        );
+                        trace.push(reason.clone());
+                        if usage.is_empty() {
+                            usage.push(TokenUsageRecord::zero(
+                                "main agent request",
+                                "local heuristic router",
+                                "no model API call",
+                            ));
+                        }
+                        trace.extend(usage_trace_lines(&usage));
+                        record_usage_observability(&usage);
+                        for entry in &trace {
+                            state.record(entry.clone());
+                        }
+                        state.observations = observations;
+                        return AgentResult::stopped(reason, trace, usage);
+                    }
+
+                    step_count += 1;
+                    let task_contract = self.build_task_contract(input, &observations);
+                    trace.push(format!("Iteration {step_count}: begin."));
+                    trace.push(format!(
+                        "Iteration {step_count}: model policy default=`{}` fallback=`{}`.",
+                        self.config.default_model, self.config.fallback_model
+                    ));
+                    trace.push(format!(
+                        "Iteration {step_count}: planner backend `{}`.",
+                        self.config.planner_backend
+                    ));
+                    trace.push(format!(
+                        "Iteration {step_count}: task goal = {}",
+                        task_contract.goal
+                    ));
+                    trace.push(format!(
+                        "Iteration {step_count}: acceptance criteria = {}",
+                        task_contract.acceptance_criteria.join(" | ")
+                    ));
+                    trace.push(format!(
+                        "Iteration {step_count}: relevant files = {}",
+                        if task_contract.relevant_files.is_empty() {
+                            "none inferred".to_string()
+                        } else {
+                            task_contract.relevant_files.join(", ")
+                        }
+                    ));
+                    if let Some(observation) = observations.last() {
+                        trace.push(format!(
+                            "Iteration {step_count}: latest observation = {}",
+                            observability::compact_text(observation, 240)
+                        ));
+                    }
+                    if retry_count > 0 {
+                        trace.push(format!(
+                            "Iteration {step_count}: retry budget used {retry_count}/{}.",
+                            self.config.max_retries
+                        ));
+                    }
+
+                    let planner_run =
+                        self.decide_next_step(state, input, &task_contract, &observations, retry_count);
+                    trace.push(format!(
+                        "Iteration {step_count}: planner decision = {}",
+                        planner_run.decision
+                    ));
+                    trace.extend(planner_run.reasoning.iter().map(|item| {
+                        format!("Iteration {step_count}: planner reasoning = {item}")
+                    }));
+                    if let Some(record) = planner_run.usage {
+                        usage.push(record);
+                    } else if !usage.iter().any(|record| record.actor == "main agent request") {
+                        usage.push(TokenUsageRecord::zero(
+                            "main agent request",
+                            "local heuristic router",
+                            "no model API call",
+                        ));
+                    }
+
+                    match planner_run.decision {
+                        Decision::CallTool {
+                            tool_name,
+                            arguments,
+                            reason,
+                        } => {
+                            trace.push(format!(
+                                "Iteration {step_count}: executing tool `{tool_name}` because {reason}"
+                            ));
+                            match self.call_tool(&tool_name, input, &arguments) {
+                                StepOutcome::Success(output) => {
+                                    let observation =
+                                        format!("Tool `{tool_name}` observation:\n{output}");
+                                    trace.push(format!(
+                                        "Iteration {step_count}: tool observation recorded."
+                                    ));
+                                    observations.push(observation);
+                                }
+                                StepOutcome::Retry(reason) => {
+                                    retry_count += 1;
+                                    let observation = format!(
+                                        "Recoverable tool failure from `{tool_name}`: {reason}"
+                                    );
+                                    trace.push(format!(
+                                        "Iteration {step_count}: {observation}"
+                                    ));
+                                    observations.push(observation);
+                                    if retry_count >= self.config.max_retries {
+                                        let stop_reason = format!(
+                                            "Retry limit reached after recoverable tool failure: {reason}"
+                                        );
+                                        trace.push(format!(
+                                            "Iteration {step_count}: stop reason = {stop_reason}"
+                                        ));
+                                        if usage.is_empty() {
+                                            usage.push(TokenUsageRecord::zero(
+                                                "main agent request",
+                                                "local heuristic router",
+                                                "no model API call",
+                                            ));
+                                        }
+                                        trace.extend(usage_trace_lines(&usage));
+                                        record_usage_observability(&usage);
+                                        for entry in &trace {
+                                            state.record(entry.clone());
+                                        }
+                                        state.observations = observations;
+                                        return AgentResult::stopped(stop_reason, trace, usage);
+                                    }
+                                }
+                            }
+                        }
+                        Decision::DelegateSubagent {
+                            subagent_name,
+                            reason,
+                        } => {
+                            trace.push(format!(
+                                "Iteration {step_count}: delegating to subagent `{subagent_name}` because {reason}"
+                            ));
+                            match self.delegate_to_subagent(&subagent_name, state, input) {
+                                Ok(result) => {
+                                    usage.extend(result.usage.clone());
+                                    observations.push(format!(
+                                        "Subagent `{subagent_name}` observation:\n{}",
+                                        result.render()
+                                    ));
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent observation recorded."
+                                    ));
+                                }
+                                Err(reason) => {
+                                    retry_count += 1;
+                                    let observation =
+                                        format!("Recoverable delegation failure: {reason}");
+                                    trace.push(format!(
+                                        "Iteration {step_count}: {observation}"
+                                    ));
+                                    observations.push(observation);
+                                    if retry_count >= self.config.max_retries {
+                                        let stop_reason = format!(
+                                            "Retry limit reached after delegation failure: {reason}"
+                                        );
+                                        trace.push(format!(
+                                            "Iteration {step_count}: stop reason = {stop_reason}"
+                                        ));
+                                        if usage.is_empty() {
+                                            usage.push(TokenUsageRecord::zero(
+                                                "main agent request",
+                                                "local heuristic router",
+                                                "no model API call",
+                                            ));
+                                        }
+                                        trace.extend(usage_trace_lines(&usage));
+                                        record_usage_observability(&usage);
+                                        for entry in &trace {
+                                            state.record(entry.clone());
+                                        }
+                                        state.observations = observations;
+                                        return AgentResult::stopped(stop_reason, trace, usage);
+                                    }
+                                }
+                            }
+                        }
+                        Decision::Finish { answer, reason } => {
+                            trace.push(format!(
+                                "Iteration {step_count}: stop reason = final answer produced ({reason})."
+                            ));
+                            state.history.push(ConversationMessage::user(input));
+                            state
+                                .history
+                                .push(ConversationMessage::assistant(answer.clone()));
+                            state.observations = observations;
+                            if usage.is_empty() {
+                                usage.push(TokenUsageRecord::zero(
+                                    "main agent request",
+                                    "local heuristic router",
+                                    "no model API call",
+                                ));
+                            }
+                            trace.extend(usage_trace_lines(&usage));
+                            record_usage_observability(&usage);
+                            for entry in &trace {
+                                state.record(entry.clone());
+                            }
+                            return AgentResult::completed(answer, trace, usage);
+                        }
+                        Decision::Retry(reason) => {
+                            retry_count += 1;
+                            trace.push(format!(
+                                "Iteration {step_count}: planner requested retry because {reason}"
+                            ));
+                            observations.push(format!("Planner retry request: {reason}"));
+                            if retry_count >= self.config.max_retries {
+                                let stop_reason =
+                                    format!("Retry limit reached because planner requested retry: {reason}");
+                                trace.push(format!(
+                                    "Iteration {step_count}: stop reason = {stop_reason}"
+                                ));
+                                if usage.is_empty() {
+                                    usage.push(TokenUsageRecord::zero(
+                                        "main agent request",
+                                        "local heuristic router",
+                                        "no model API call",
+                                    ));
+                                }
+                                trace.extend(usage_trace_lines(&usage));
+                                record_usage_observability(&usage);
+                                for entry in &trace {
+                                    state.record(entry.clone());
+                                }
+                                state.observations = observations;
+                                return AgentResult::stopped(stop_reason, trace, usage);
+                            }
+                        }
+                        Decision::Stop(reason) => {
+                            trace.push(format!(
+                                "Iteration {step_count}: stop reason = {reason}"
+                            ));
+                            if usage.is_empty() {
+                                usage.push(TokenUsageRecord::zero(
+                                    "main agent request",
+                                    "local heuristic router",
+                                    "no model API call",
+                                ));
+                            }
+                            trace.extend(usage_trace_lines(&usage));
+                            record_usage_observability(&usage);
+                            for entry in &trace {
+                                state.record(entry.clone());
+                            }
+                            state.observations = observations;
+                            return AgentResult::stopped(reason, trace, usage);
+                        }
+                    }
+                }
+            },
+        )
     }
 
     fn decide_next_step(
         &self,
-        history: &[ConversationMessage],
-        state: &AgentState,
-        user_input: &str,
-        observer: Option<&mut dyn StreamObserver>,
+        state: &SessionState,
+        input: &str,
+        task_contract: &TaskContract,
+        observations: &[String],
+        retry_count: u8,
     ) -> PlannerRun {
-        self.observability.with_span(
-            "planner.decide_next_step",
-            vec![
-                KeyValue::new(
-                    "planner.backend",
-                    if self.llm_engine.is_some() {
-                        "openai"
-                    } else {
-                        "heuristic"
-                    },
-                ),
-                KeyValue::new("agent.retry_count", state.retries as i64),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(user_input, 1_000),
-                ),
-            ],
-            || {
-                if let Some(engine) = &self.llm_engine {
-                    match engine.plan(
-                        &self.config,
-                        &self.tools,
-                        &self.skills,
-                        history,
-                        state,
-                        user_input,
-                        observer,
-                        &self.observability,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(reason) => PlannerRun::new(Decision::Retry(format!(
-                            "OpenAI planner call failed: {reason}"
-                        ))),
-                    }
-                } else {
-                    PlannerRun::new(decide_next_step_heuristic(
-                        &self.config,
-                        &self.tools,
-                        &self.skills,
-                        state,
-                        user_input,
-                    ))
-                }
-            },
-        )
-    }
-
-    fn call_tool(&self, tool_name: &str, user_input: &str, arguments: &Value) -> StepOutcome {
-        self.observability.with_span(
-            format!("tool.{tool_name}"),
-            vec![
-                KeyValue::new("langsmith.span.kind", "tool"),
-                KeyValue::new("tool.name", tool_name.to_string()),
-                observability::kv_json("tool.arguments", arguments),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(user_input, 1_000),
-                ),
-            ],
-            || {
-                let outcome = match self.tools.iter().find(|tool| tool.is_named(tool_name)) {
-                    Some(tool) => tool.run(user_input, arguments),
-                    None => StepOutcome::Retry(format!("Unknown tool requested: {tool_name}")),
-                };
-                record_step_outcome("tool", &outcome);
-                outcome
-            },
-        )
-    }
-
-    fn call_skill(
-        &self,
-        skill_name: &str,
-        history: &[ConversationMessage],
-        user_input: &str,
-        state: &mut AgentState,
-    ) -> StepOutcome {
-        self.observability.with_span(
-            format!("skill.{skill_name}"),
-            vec![
-                KeyValue::new("langsmith.span.kind", "chain"),
-                KeyValue::new("skill.name", skill_name.to_string()),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(user_input, 1_000),
-                ),
-            ],
-            || {
-                let outcome = match self.skills.iter().find(|skill| skill.is_named(skill_name)) {
-                    Some(skill) => skill.run(
-                        user_input,
-                        history,
-                        state,
-                        self.llm_engine.as_ref(),
-                        &self.config.system_prompt,
-                        &self.observability,
-                    ),
-                    None => StepOutcome::Retry(format!("Unknown skill requested: {skill_name}")),
-                };
-                record_step_outcome("skill", &outcome);
-                outcome
-            },
-        )
-    }
-
-    fn registered_queue_agent_labels(&self) -> Vec<String> {
-        let mut labels = vec!["ingress_agent".to_string()];
-        for skill in &self.skills {
-            let label = match skill.name() {
-                "planner" => "planner_agent".to_string(),
-                "summarize" => "summarize_agent".to_string(),
-                "retry_once" => "retry_once_agent".to_string(),
-                other => format!("skill::{other}"),
-            };
-            labels.push(label);
-        }
-        labels
-    }
-
-    fn process_ingress_submission(&self, input: &str, show_trace: bool, bootstrap: bool) {
-        self.observability.with_span(
-            "ingress_agent.process_submission",
-            vec![
-                KeyValue::new("langsmith.trace.name", "ingress_agent.process_submission"),
-                KeyValue::new("langsmith.span.kind", "tool"),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(input, 2_000),
-                ),
-                KeyValue::new("ingress.bootstrap", bootstrap),
-            ],
-            || {
-                if let Err(reason) = ingress_agent::append_conversation_history("user", input) {
-                    eprintln!("Conversation history update failed: {reason}");
-                }
-                runtime_log::info(
-                    "ingress_agent",
-                    format!(
-                        "received {}submission for queue ingestion",
-                        if bootstrap { "bootstrap " } else { "" }
-                    ),
-                );
-
-                let ack = match ingress_agent::queue_ingress(input, &Value::Null) {
-                    Ok(ack) => ack,
-                    Err(reason) => {
-                        Observability::set_status_error(reason.clone());
-                        if bootstrap {
-                            eprintln!("Bootstrap ingress submission failed: {reason}");
-                        } else {
-                            eprintln!("Ingress submission failed: {reason}");
-                        }
-                        return;
-                    }
-                };
-                Observability::set_attributes(vec![
-                    KeyValue::new("ingress.queue_id", ack.queue_id.clone()),
-                    KeyValue::new("ingress.queue_path", ack.queue_path.clone()),
-                ]);
-                Observability::set_status_ok();
-                runtime_log::info(
-                    "ingress_agent",
-                    format!(
-                        "queued ingress item {} into {}",
-                        ack.queue_id, ack.queue_path
-                    ),
-                );
-
-                if bootstrap {
-                    println!("\nBootstrap ingress submission:");
-                } else {
-                    println!("\nIngress submission:");
-                }
-                println!("{}", ack.render());
-
-                let _ = self.process_pending_queue_work(show_trace);
-            },
-        );
-    }
-
-    fn process_pending_queue_work(&self, show_trace: bool) -> bool {
-        self.observability.with_span(
-            "planner_agent.queue_cycle",
-            vec![
-                KeyValue::new("langsmith.trace.name", "planner_agent.queue_cycle"),
-                KeyValue::new("langsmith.span.kind", "chain"),
-            ],
-            || {
-                let pending_entries = match planner_agent::pending_queue_entries() {
-                    Ok(entries) => entries,
-                    Err(reason) => {
-                        eprintln!("planner_agent queue inspection failed: {reason}");
-                        Observability::set_status_error(reason.clone());
-                        runtime_log::error(
-                            "planner_agent",
-                            format!("queue inspection failed: {reason}"),
-                        );
-                        return true;
-                    }
-                };
-
-                if pending_entries.is_empty() {
-                    Observability::record_event("planner_agent.noop", Vec::new());
-                    Observability::set_status_ok();
-                    return false;
-                }
-
-                Observability::set_attributes(vec![KeyValue::new(
-                    "planner.pending_entries",
-                    pending_entries.len() as i64,
-                )]);
-                runtime_log::info(
-                    "planner_agent",
-                    format!(
-                        "picked up {} unplanned ingress item(s)",
-                        pending_entries.len()
-                    ),
-                );
-
-                println!(
-                    "\nplanner_agent picked up {} queued item(s) from {}.",
-                    pending_entries.len(),
-                    ingress_agent::resolve_queue_path().display()
-                );
-
-                let planner_prompt = format!(
-                    "Read ingress queue items and write the next explicit action to {}.",
-                    planner_agent::resolve_planner_queue_path().display()
-                );
-                let mut state = AgentState::new();
-                let outcome = self.call_skill("planner", &[], &planner_prompt, &mut state);
-                println!("planner_agent:");
-                match outcome {
-                    StepOutcome::Success(output) => {
-                        println!("{output}");
-                        Observability::set_status_ok();
-                        runtime_log::info(
-                            "planner_agent",
-                            format!(
-                                "planner run completed; planner queue path {}",
-                                planner_agent::resolve_planner_queue_path().display()
-                            ),
-                        );
-                        if let Err(reason) =
-                            ingress_agent::append_conversation_history("assistant", &output)
-                        {
-                            eprintln!("Conversation history update failed: {reason}");
-                        }
-                    }
-                    StepOutcome::Retry(reason) => {
-                        Observability::set_status_error(reason.clone());
-                        runtime_log::warn(
-                            "planner_agent",
-                            format!("planner requested retry: {reason}"),
-                        );
-                        eprintln!("planner_agent retry: {reason}");
-                    }
-                }
-
-                if show_trace && !state.trace.is_empty() {
-                    println!("planner_agent trace:");
-                    for step in &state.trace {
-                        println!("- {step}");
-                    }
-                }
-
-                true
-            },
-        )
-    }
-}
-
-fn resolve_queue_poll_interval() -> Duration {
-    env::var("AGENT_QUEUE_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(DEFAULT_QUEUE_POLL_INTERVAL_MS))
-}
-
-fn should_continue_polling_after_stdin_close(stdin_is_terminal: bool) -> bool {
-    !stdin_is_terminal
-}
-
-fn spawn_queue_input_reader() -> mpsc::Receiver<QueueInputEvent> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let event = match line {
-                Ok(line) => QueueInputEvent::Line(line),
-                Err(error) => QueueInputEvent::Error(error.to_string()),
-            };
-
-            if sender.send(event).is_err() {
-                return;
-            }
-        }
-
-        let _ = sender.send(QueueInputEvent::Eof);
-    });
-    receiver
-}
-
-#[derive(Debug, Clone)]
-pub struct Skill {
-    name: String,
-    description: String,
-    source: SkillSource,
-}
-
-impl Skill {
-    fn built_in(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        kind: BuiltInSkill,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            source: SkillSource::BuiltIn(kind),
-        }
-    }
-
-    fn installed(manifest: InstalledSkillManifest) -> Self {
-        Self {
-            name: manifest.name.clone(),
-            description: manifest.description.clone(),
-            source: SkillSource::Installed(manifest),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn is_named(&self, name: &str) -> bool {
-        self.name == name
-    }
-
-    fn run(
-        &self,
-        user_input: &str,
-        history: &[ConversationMessage],
-        state: &mut AgentState,
-        llm_engine: Option<&OpenAiEngine>,
-        system_prompt: &str,
-        observability: &Observability,
-    ) -> StepOutcome {
-        match &self.source {
-            SkillSource::BuiltIn(kind) => match kind {
-                BuiltInSkill::Planner => planner_agent::run(user_input),
-                BuiltInSkill::Summarize => summarize_agent::run(user_input),
-                BuiltInSkill::RetryOnce => retry_once_agent::run(state.retries),
-            },
-            SkillSource::Installed(manifest) => {
-                state.record(format!(
-                    "Loaded installed skill `{}` from {}",
-                    self.name,
-                    manifest.skill_file.display()
-                ));
-                match manifest.load_definition() {
-                    Ok(loaded) => {
-                        state.record(format!(
-                            "Installed skill `{}` resources: {}",
-                            self.name,
-                            loaded.resource_summary()
-                        ));
-                        if let Some(engine) = llm_engine {
-                            match engine.execute_skill(
-                                &self.name,
-                                &self.description,
-                                &loaded,
-                                &render_workspace_markdown_context(),
-                                history,
-                                user_input,
-                                system_prompt,
-                                &state.recent_trace(10),
-                                observability,
-                            ) {
-                                Ok(output) => StepOutcome::Success(output),
-                                Err(reason) => StepOutcome::Retry(format!(
-                                    "Installed skill `{}` execution failed: {}",
-                                    self.name, reason
-                                )),
+        if let Some(engine) = &self.llm_engine {
+            match engine.plan(
+                &self.config,
+                &self.tools,
+                &self.subagents,
+                state,
+                input,
+                task_contract,
+                observations,
+                retry_count,
+            ) {
+                Ok(plan) => return plan,
+                Err(reason) => {
+                    if let Some(engine) = &self.fallback_engine {
+                        match engine.plan(
+                            &self.config,
+                            &self.tools,
+                            &self.subagents,
+                            state,
+                            input,
+                            task_contract,
+                            observations,
+                            retry_count,
+                        ) {
+                            Ok(mut plan) => {
+                                plan.reasoning.push(format!(
+                                    "Primary planner failed and the harness fell back to `{}`: {}",
+                                    self.config.fallback_model, reason
+                                ));
+                                return plan;
                             }
-                        } else {
-                            StepOutcome::Success(render_skill_fallback_output(
-                                &self.name,
-                                &self.description,
-                                &loaded,
-                                user_input,
-                            ))
+                            Err(fallback_reason) => {
+                                let mut fallback = heuristic_plan(
+                                    input,
+                                    &self.tools,
+                                    &self.subagents,
+                                    observations,
+                                );
+                                fallback.reasoning.push(format!(
+                                    "OpenAI planner failed: {reason}"
+                                ));
+                                fallback.reasoning.push(format!(
+                                    "Fallback planner `{}` failed: {}",
+                                    self.config.fallback_model, fallback_reason
+                                ));
+                                fallback.reasoning.push(
+                                    "The harness fell back to the local heuristic router."
+                                        .to_string(),
+                                );
+                                return fallback;
+                            }
                         }
                     }
-                    Err(reason) => StepOutcome::Retry(format!(
-                        "Installed skill `{}` could not be loaded: {}",
-                        self.name, reason
-                    )),
-                }
-            }
-        }
-    }
-}
 
-#[derive(Debug, Clone)]
-enum SkillSource {
-    BuiltIn(BuiltInSkill),
-    Installed(InstalledSkillManifest),
-}
-
-#[derive(Debug, Clone)]
-enum BuiltInSkill {
-    Planner,
-    Summarize,
-    RetryOnce,
-}
-
-#[derive(Debug, Clone)]
-struct InstalledSkillManifest {
-    name: String,
-    description: String,
-    directory: PathBuf,
-    skill_file: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct LoadedInstalledSkill {
-    directory: PathBuf,
-    markdown: String,
-    body: String,
-    resource_files: Vec<PathBuf>,
-}
-
-impl LoadedInstalledSkill {
-    fn resource_summary(&self) -> String {
-        if self.resource_files.is_empty() {
-            "no bundled resource files".to_string()
-        } else {
-            self.resource_files
-                .iter()
-                .map(|path| path.strip_prefix(&self.directory).unwrap_or(path))
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    }
-}
-
-impl InstalledSkillManifest {
-    fn load_definition(&self) -> Result<LoadedInstalledSkill, String> {
-        let markdown = fs::read_to_string(&self.skill_file)
-            .map_err(|error| format!("read {} failed: {error}", self.skill_file.display()))?;
-        Ok(LoadedInstalledSkill {
-            directory: self.directory.clone(),
-            body: strip_skill_frontmatter(&markdown).trim().to_string(),
-            markdown,
-            resource_files: list_skill_resource_files(&self.directory),
-        })
-    }
-}
-
-fn built_in_skills() -> Vec<Skill> {
-    vec![
-        Skill::built_in(
-            "planner",
-            "Use when the request should inspect ingress queue items, read markdown workspace context, and write the next-step plan into logs/planner_queue.jsonl.",
-            BuiltInSkill::Planner,
-        ),
-        Skill::built_in(
-            "summarize",
-            "Use when the request should be compressed into a short summary.",
-            BuiltInSkill::Summarize,
-        ),
-        Skill::built_in(
-            "retry_once",
-            "Use when you need to exercise the retry path with one recoverable failure.",
-            BuiltInSkill::RetryOnce,
-        ),
-    ]
-}
-
-fn load_skill_catalog_from_dir(skills_dir: &Path) -> (Vec<Skill>, Vec<String>) {
-    let mut warnings = Vec::new();
-    let mut catalog = BTreeMap::new();
-
-    for skill in built_in_skills() {
-        catalog.insert(skill.name().to_string(), skill);
-    }
-
-    match load_installed_skills_from_dir(skills_dir) {
-        Ok(installed_skills) => {
-            for skill in installed_skills {
-                let name = skill.name().to_string();
-                if catalog.insert(name.clone(), skill).is_some() {
-                    warnings.push(format!(
-                        "Installed skill `{name}` overrides an existing skill with the same name."
+                    let mut fallback =
+                        heuristic_plan(input, &self.tools, &self.subagents, observations);
+                    fallback.reasoning.push(format!(
+                        "OpenAI planner failed; fell back to the local heuristic router: {reason}"
                     ));
+                    return fallback;
                 }
             }
         }
-        Err(reason) => warnings.push(reason),
-    }
 
-    (catalog.into_values().collect(), warnings)
-}
-
-fn load_installed_skills_from_dir(skills_dir: &Path) -> Result<Vec<Skill>, String> {
-    if !skills_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let entries = fs::read_dir(skills_dir)
-        .map_err(|error| format!("could not read {}: {error}", skills_dir.display()))?;
-    let mut skills = Vec::new();
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|error| format!("failed to read skills directory entry: {error}"))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let skill_file = path.join(SKILL_FILE_NAME);
-        if !skill_file.is_file() {
-            continue;
-        }
-
-        match parse_installed_skill_manifest(&path, &skill_file) {
-            Ok(manifest) => skills.push(Skill::installed(manifest)),
-            Err(reason) => {
-                return Err(format!("failed to load {}: {}", path.display(), reason));
+        if let Some(engine) = &self.fallback_engine {
+            match engine.plan(
+                &self.config,
+                &self.tools,
+                &self.subagents,
+                state,
+                input,
+                task_contract,
+                observations,
+                retry_count,
+            ) {
+                Ok(plan) => return plan,
+                Err(reason) => {
+                    let mut fallback =
+                        heuristic_plan(input, &self.tools, &self.subagents, observations);
+                    fallback.reasoning.push(format!(
+                        "Fallback planner `{}` failed; fell back to the local heuristic router: {reason}",
+                        self.config.fallback_model
+                    ));
+                    return fallback;
+                }
             }
         }
+
+        heuristic_plan(input, &self.tools, &self.subagents, observations)
     }
 
-    skills.sort_by(|left, right| left.name().cmp(right.name()));
-    Ok(skills)
-}
+    fn call_tool(&self, name: &str, user_input: &str, arguments: &Value) -> StepOutcome {
+        match self.tools.iter().find(|tool| tool.is_named(name)) {
+            Some(tool) => tool.run(user_input, arguments),
+            None => StepOutcome::Retry(format!("Unknown tool `{name}`.")),
+        }
+    }
 
-fn parse_installed_skill_manifest(
-    directory: &Path,
-    skill_file: &Path,
-) -> Result<InstalledSkillManifest, String> {
-    let markdown = fs::read_to_string(skill_file)
-        .map_err(|error| format!("read {} failed: {error}", skill_file.display()))?;
-    let frontmatter = parse_skill_frontmatter(&markdown);
-    let fallback_name = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unnamed-skill")
-        .trim()
-        .to_string();
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(fallback_name);
-    let description = frontmatter
-        .get("description")
-        .cloned()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            "Use when the request explicitly asks for this installed skill.".to_string()
-        });
-
-    Ok(InstalledSkillManifest {
-        name,
-        description,
-        directory: directory.to_path_buf(),
-        skill_file: skill_file.to_path_buf(),
-    })
-}
-
-fn parse_skill_frontmatter(markdown: &str) -> BTreeMap<String, String> {
-    let mut result = BTreeMap::new();
-    let Some(rest) = markdown.strip_prefix("---\n") else {
-        return result;
-    };
-    let Some((frontmatter, _)) = rest.split_once("\n---\n") else {
-        return result;
-    };
-
-    for line in frontmatter.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
+    fn delegate_to_subagent(
+        &self,
+        subagent_name: &str,
+        state: &SessionState,
+        task: &str,
+    ) -> Result<DelegationResult, String> {
+        let spec = self
+            .subagents
+            .get(subagent_name)
+            .ok_or_else(|| format!("Unknown subagent `{subagent_name}`."))?;
+        let context_packet = self.build_context_packet(task, state);
+        let file_refs = if context_packet.relevant_files.is_empty() {
+            suggest_relevant_files(&self.root_dir, task)
+        } else {
+            context_packet.relevant_files.clone()
         };
-        result.insert(
-            key.trim().to_string(),
-            value
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string(),
-        );
-    }
-
-    result
-}
-
-fn strip_skill_frontmatter(markdown: &str) -> String {
-    let Some(rest) = markdown.strip_prefix("---\n") else {
-        return markdown.to_string();
-    };
-    match rest.split_once("\n---\n") {
-        Some((_, body)) => body.to_string(),
-        None => markdown.to_string(),
-    }
-}
-
-fn list_skill_resource_files(directory: &Path) -> Vec<PathBuf> {
-    let mut resources = Vec::new();
-    let Ok(entries) = fs::read_dir(directory) else {
-        return resources;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file()
-            && path.file_name().and_then(|name| name.to_str()) != Some(SKILL_FILE_NAME)
-        {
-            resources.push(path);
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_nested_files(&path, &mut resources);
-        }
-    }
-
-    resources.sort();
-    resources
-}
-
-fn collect_nested_files(directory: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_nested_files(&path, files);
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-}
-
-fn render_skill_fallback_output(
-    skill_name: &str,
-    description: &str,
-    loaded: &LoadedInstalledSkill,
-    user_input: &str,
-) -> String {
-    let preview = loaded
-        .body
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .take(12)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "Installed skill `{skill_name}` was loaded from `{}`.\nDescription: {description}\nUser request: {user_input}\nBundled resources: {}\n\nSKILL.md preview:\n{}",
-        loaded.directory.display(),
-        loaded.resource_summary(),
-        preview
-    )
-}
-
-fn resolve_workspace_context_dir() -> PathBuf {
-    env::var("AGENT_WORKSPACE_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(WORKSPACE_CONTEXT_DIR))
-}
-
-fn load_markdown_documents(workspace_dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
-    let mut documents = Vec::new();
-
-    for relative_path in REPO_CONTEXT_FILES {
-        let path = PathBuf::from(relative_path);
-        if !path.is_file() {
-            continue;
-        }
-        let contents = fs::read_to_string(&path)
-            .map_err(|error| format!("read {} failed: {error}", path.display()))?;
-        documents.push((path, contents));
-    }
-
-    if workspace_dir.is_dir() {
-        let mut workspace_paths = fs::read_dir(workspace_dir)
-            .map_err(|error| format!("could not read {}: {error}", workspace_dir.display()))?
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(|extension| extension.eq_ignore_ascii_case("md"))
-                        .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        workspace_paths.sort();
-
-        for path in workspace_paths {
-            let contents = fs::read_to_string(&path)
-                .map_err(|error| format!("read {} failed: {error}", path.display()))?;
-            documents.push((path, contents));
-        }
-    }
-
-    Ok(documents)
-}
-
-fn load_agent_markdown_documents() -> Result<Vec<(PathBuf, String)>, String> {
-    load_markdown_documents(&resolve_workspace_context_dir())
-}
-
-fn render_workspace_markdown_context() -> String {
-    match load_agent_markdown_documents() {
-        Ok(documents) if documents.is_empty() => {
-            "No repo or workspace markdown context files were found.".to_string()
-        }
-        Ok(documents) => documents
-            .into_iter()
-            .map(|(path, contents)| format!("## {}\n{}", path.display(), contents.trim()))
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        Err(reason) => format!("Markdown context could not be loaded: {reason}"),
-    }
-}
-
-fn render_compact_runtime_context(history: &[ConversationMessage]) -> String {
-    let markdown_context = match load_agent_markdown_documents() {
-        Ok(documents) if documents.is_empty() => "Markdown context: none".to_string(),
-        Ok(documents) => {
-            let digest = documents
-                .into_iter()
-                .map(|(path, contents)| {
-                    format!(
-                        "- {} => {}",
-                        path.display(),
-                        compact_text_preview(&contents, MAX_COMPACT_CONTEXT_DOC_CHARS)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("Markdown context digest:\n{digest}")
-        }
-        Err(reason) => format!("Markdown context unavailable: {reason}"),
-    };
-
-    let persisted_history =
-        match ingress_agent::ensure_conversation_history_file().and_then(|path| {
-            fs::read_to_string(&path)
-                .map_err(|error| format!("read {} failed: {error}", path.display()))
-        }) {
-            Ok(contents) => compact_text_preview(&contents, 700),
-            Err(reason) => format!("Conversation history unavailable: {reason}"),
-        };
-
-    let recent_history = if history.is_empty() {
-        "In-memory history: none".to_string()
-    } else {
-        let start = history
-            .len()
-            .saturating_sub(MAX_COMPACT_CONTEXT_HISTORY_MESSAGES);
-        let digest = history[start..]
+        let memory_refs = self
+            .memory_stack
+            .sources
             .iter()
+            .map(|source| source.path.display().to_string())
+            .collect::<Vec<_>>();
+        let observations = state
+            .history
+            .iter()
+            .rev()
+            .take(4)
             .map(|message| {
-                let label = match message.role {
+                let role = match message.role {
                     MessageRole::User => "user",
                     MessageRole::Assistant => "assistant",
                 };
-                format!("{label}: {}", compact_text_preview(&message.content, 180))
+                format!(
+                    "{role}: {}",
+                    observability::compact_text(&message.content, 180)
+                )
             })
             .collect::<Vec<_>>()
-            .join("\n");
-        format!("Recent conversation digest:\n{digest}")
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let request = DelegationRequest {
+            subagent: spec.name.clone(),
+            context_packet,
+            memory_refs,
+            file_refs,
+            observations,
+            task: task.to_string(),
+        };
+        self.observability.with_span(
+            format!("subagent.{}", spec.name),
+            vec![
+                KeyValue::new("subagent.name", spec.name.clone()),
+                KeyValue::new("subagent.scope", spec.scope.clone()),
+            ],
+            || Ok(execute_subagent(spec, request)),
+        )
+    }
+
+    fn build_context_packet(&self, task: &str, state: &SessionState) -> ContextPacket {
+        let task_contract = self.build_task_contract(task, &state.observations);
+        let relevant_files = task_contract.relevant_files.clone();
+        let mut known_facts = vec![
+            format!(
+                "Project memory sources loaded: {}",
+                self.memory_stack.sources.len()
+            ),
+            format!(
+                "Available subagents: {}",
+                self.subagents
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!(
+                "Available tools: {}",
+                self.tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ];
+        if let Some(summary) = &state.compacted_summary {
+            known_facts.push(format!(
+                "Compacted prior session summary: {}",
+                observability::compact_text(summary, 220)
+            ));
+        }
+        ContextPacket {
+            goal: task_contract.goal,
+            constraints: task_contract.constraints,
+            relevant_files,
+            known_facts,
+            missing_facts: vec![
+                "Whether network-backed model execution is enabled for this run.".to_string(),
+                "Whether the user wants execution or review only for any planned changes."
+                    .to_string(),
+            ],
+            next_action: "Return a concise delegated result to the parent session.".to_string(),
+            stop_condition: task_contract.stop_condition,
+        }
+    }
+
+    fn build_task_contract(&self, task: &str, observations: &[String]) -> TaskContract {
+        let mut constraints = vec![
+            "Start from project memory and repository-local instructions before acting."
+                .to_string(),
+            "Take exactly one action per loop iteration: call a tool, delegate to a subagent, retry, stop, or finalize."
+                .to_string(),
+            "Keep the working set compact and prefer explicit observations over hidden reasoning."
+                .to_string(),
+        ];
+        if !observations.is_empty() {
+            constraints.push(
+                "Use the latest recorded observation before asking for more actions.".to_string(),
+            );
+        }
+
+        TaskContract {
+            goal: format!("Resolve the user task: {task}"),
+            constraints,
+            acceptance_criteria: vec![
+                "The next action is justified from the current task contract.".to_string(),
+                "Tool, delegation, retry, and stop behavior remain visible in the execution trace."
+                    .to_string(),
+                "The run stops with a final answer or an explicit stop reason.".to_string(),
+            ],
+            relevant_files: suggest_relevant_files(&self.root_dir, task),
+            stop_condition:
+                "Stop when a final answer is available, the planner decides to stop, or the retry budget is exhausted."
+                    .to_string(),
+        }
+    }
+
+    fn handle_slash_command(
+        &mut self,
+        state: &mut SessionState,
+        input: &str,
+        bin_name: &str,
+    ) -> io::Result<CommandOutcome> {
+        match parse_slash_command(input, &self.commands) {
+            SlashCommand::Help => Ok(CommandOutcome::Continue(self.chat_help_text(bin_name))),
+            SlashCommand::Agents => Ok(CommandOutcome::Continue(self.render_agents())),
+            SlashCommand::Memory => Ok(CommandOutcome::Continue(self.render_memory())),
+            SlashCommand::Model => Ok(CommandOutcome::Continue(self.render_model())),
+            SlashCommand::Clear => {
+                state.clear();
+                Ok(CommandOutcome::Continue(
+                    "Cleared session history and trace. Project memory remains loaded.".to_string(),
+                ))
+            }
+            SlashCommand::Compact => {
+                let summary = compact_history(&state.history);
+                state.history.clear();
+                state.compacted_summary = Some(summary.clone());
+                Ok(CommandOutcome::Continue(format!(
+                    "Compacted session history.\nSummary: {summary}"
+                )))
+            }
+            SlashCommand::Mcp => Ok(CommandOutcome::Continue(self.render_mcp())),
+            SlashCommand::Review(task) => {
+                Ok(CommandOutcome::Continue(self.run_review(state, &task)))
+            }
+            SlashCommand::Init => {
+                let created = self.init_project_files()?;
+                if created.is_empty() {
+                    Ok(CommandOutcome::Continue(
+                        "Claude-style project files already exist.".to_string(),
+                    ))
+                } else {
+                    Ok(CommandOutcome::Continue(format!(
+                        "Created Claude-style project files:\n{}",
+                        created
+                            .iter()
+                            .map(|path| format!("- {}", path.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )))
+                }
+            }
+            SlashCommand::Agent { name, task } => {
+                match self.delegate_to_subagent(&name, state, &task) {
+                    Ok(result) => Ok(CommandOutcome::Continue(result.render())),
+                    Err(reason) => Ok(CommandOutcome::Continue(reason)),
+                }
+            }
+            SlashCommand::Exit => Ok(CommandOutcome::Exit("Session ended.".to_string())),
+            SlashCommand::Custom { name, arguments } => {
+                let Some(command) = self.commands.get(&name) else {
+                    return Ok(CommandOutcome::Continue(format!(
+                        "Unknown slash command `/{name}`."
+                    )));
+                };
+                let expanded = expand_custom_command(command, &arguments);
+                Ok(CommandOutcome::Continue(
+                    self.run_with_state(state, &expanded).output,
+                ))
+            }
+            SlashCommand::Unknown(name) if name == "trace" => Ok(CommandOutcome::ToggleTrace),
+            SlashCommand::Unknown(name) => Ok(CommandOutcome::Continue(format!(
+                "Unknown slash command `/{name}`."
+            ))),
+        }
+    }
+
+    fn run_review(&self, state: &SessionState, task: &str) -> String {
+        let focus = if task.trim().is_empty() {
+            "general repository review".to_string()
+        } else {
+            task.trim().to_string()
+        };
+        let files = suggest_relevant_files(&self.root_dir, &focus);
+        let findings = if files.is_empty() {
+            vec!["No obvious target files matched the current review focus.".to_string()]
+        } else {
+            files
+                .iter()
+                .map(|path| format!("Review target worth checking: {path}"))
+                .collect::<Vec<_>>()
+        };
+        let prior_context = state
+            .compacted_summary
+            .as_deref()
+            .map(|summary| format!("Compacted session context: {summary}\n\n"))
+            .unwrap_or_default();
+        format!(
+            "Review focus: {focus}\n\n{prior_context}Findings:\n{}\n\nOpen questions:\n- Verify behavior with targeted tests.\n- Confirm whether any project command or subagent should own this workflow.\n\nChange summary:\n- Review runs as a workflow, not as a permanent validator agent.",
+            findings
+                .into_iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    fn render_agents(&self) -> String {
+        let mut lines = vec!["Subagents:".to_string()];
+        if self.subagents.is_empty() {
+            lines.push("- none".to_string());
+        } else {
+            for spec in self.subagents.values() {
+                let tools = spec
+                    .tool_allowlist
+                    .as_ref()
+                    .map(|items| items.join(", "))
+                    .unwrap_or_else(|| "inherit parent tools".to_string());
+                lines.push(format!(
+                    "- {} [{}] tools={} path={}",
+                    spec.name,
+                    spec.scope,
+                    tools,
+                    spec.source_path.display()
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn render_memory(&self) -> String {
+        let mut lines = vec!["Memory sources:".to_string()];
+        if self.memory_stack.sources.is_empty() {
+            lines.push("- none".to_string());
+        } else {
+            for source in &self.memory_stack.sources {
+                let imported = source
+                    .imported_from
+                    .as_ref()
+                    .map(|path| format!(" imported_from={}", path.display()))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "- [{}] {}{}",
+                    source.scope,
+                    source.path.display(),
+                    imported
+                ));
+            }
+        }
+        lines.push(String::new());
+        lines.push("Merged memory preview:".to_string());
+        lines.push(observability::compact_text(
+            &self.memory_stack.merged_instructions,
+            800,
+        ));
+        lines.join("\n")
+    }
+
+    fn render_model(&self) -> String {
+        format!(
+            "Model policy\n- default: {}\n- fallback: {}\n- planner backend: {}",
+            self.config.default_model, self.config.fallback_model, self.config.planner_backend
+        )
+    }
+
+    fn render_mcp(&self) -> String {
+        let mut lines = vec!["MCP status:".to_string()];
+        if self.mcp_servers.is_empty() {
+            lines.push("- no MCP servers loaded".to_string());
+        } else {
+            for server in &self.mcp_servers {
+                lines.push(format!("- {}", server));
+            }
+        }
+        let tool_names = self
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<_>>();
+        lines.push(String::new());
+        lines.push(format!("Visible tools: {}", tool_names.join(", ")));
+        lines.join("\n")
+    }
+
+    fn chat_help_text(&self, bin_name: &str) -> String {
+        let mut lines = vec![
+            format!("Use `{bin_name} list` to inspect loaded memory, subagents, commands, and tools."),
+            "Built-in commands:".to_string(),
+            "/help, /agents, /memory, /model, /clear, /compact, /mcp, /review [task], /init, /agent <name> <task>, /trace, /exit".to_string(),
+        ];
+        if !self.commands.is_empty() {
+            lines.push("Project commands:".to_string());
+            for command in self.commands.values() {
+                lines.push(format!("/{} - {}", command.name, command.description));
+            }
+        }
+        lines.join("\n")
+    }
+
+    pub fn default_model(&self) -> &str {
+        self.config.default_model
+    }
+
+    pub fn system_prompt(&self) -> &str {
+        &self.config.system_prompt
+    }
+
+    pub fn fallback_model(&self) -> &str {
+        self.config.fallback_model
+    }
+
+    pub fn planner_backend_label(&self) -> &str {
+        &self.config.planner_backend
+    }
+
+    pub fn tools(&self) -> &[Tool] {
+        &self.tools
+    }
+
+    pub fn mcp_servers(&self) -> &[McpServerSummary] {
+        &self.mcp_servers
+    }
+
+    pub fn memory_sources(&self) -> &[MemorySource] {
+        &self.memory_stack.sources
+    }
+
+    pub fn subagents(&self) -> Vec<&SubagentSpec> {
+        self.subagents.values().collect()
+    }
+
+    pub fn command_summaries(&self) -> Vec<String> {
+        self.commands
+            .values()
+            .map(|command| {
+                format!(
+                    "/{} [{}] {}",
+                    command.name, command.scope, command.description
+                )
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandOutcome {
+    Continue(String),
+    Exit(String),
+    ToggleTrace,
+}
+
+fn parse_slash_command(input: &str, commands: &BTreeMap<String, CustomCommand>) -> SlashCommand {
+    let trimmed = input.trim().trim_start_matches('/');
+    let (name, remainder) = match trimmed.split_once(' ') {
+        Some((name, remainder)) => (name, remainder.trim()),
+        None => (trimmed, ""),
     };
 
-    format!(
-        "Task contract\n- goal: compact repo markdown, memory, and conversation context before the planner chooses its next action\n- constraints: keep only the highest-signal context, preserve active conversation state, and prefer repo-local markdown as source of truth\n- acceptance_criteria: the planner sees a concise context packet grounded in markdown files plus conversation history\n- stop_condition: stop after providing the compact context packet for the current decision\n\n{}\n\nPersisted conversation history:\n{}\n\n{}",
-        markdown_context, persisted_history, recent_history
-    )
+    match name {
+        "help" => SlashCommand::Help,
+        "agents" => SlashCommand::Agents,
+        "memory" => SlashCommand::Memory,
+        "model" => SlashCommand::Model,
+        "clear" => SlashCommand::Clear,
+        "compact" => SlashCommand::Compact,
+        "mcp" => SlashCommand::Mcp,
+        "review" => SlashCommand::Review(remainder.to_string()),
+        "init" => SlashCommand::Init,
+        "trace" => SlashCommand::Unknown("trace".to_string()),
+        "exit" | "quit" => SlashCommand::Exit,
+        "agent" => {
+            let Some((agent_name, task)) = remainder.split_once(' ') else {
+                return SlashCommand::Unknown("agent".to_string());
+            };
+            SlashCommand::Agent {
+                name: agent_name.trim().to_string(),
+                task: task.trim().to_string(),
+            }
+        }
+        other if commands.contains_key(other) => SlashCommand::Custom {
+            name: other.to_string(),
+            arguments: remainder.to_string(),
+        },
+        other => SlashCommand::Unknown(other.to_string()),
+    }
 }
 
-fn compact_text_preview(value: &str, limit: usize) -> String {
-    let normalized = value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let shortened = normalized.chars().take(limit).collect::<String>();
-    if normalized.chars().count() > limit {
-        format!("{shortened}...")
+fn parse_explicit_tool_request(input: &str) -> Option<(String, Value)> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let prefix = "use tool ";
+    if !lower.starts_with(prefix) {
+        return None;
+    }
+
+    let remainder = trimmed[prefix.len()..].trim();
+    let (tool_name, raw_arguments) = match remainder.split_once(" with ") {
+        Some((name, json_body)) => (name.trim(), json_body.trim()),
+        None => (remainder, ""),
+    };
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let arguments = if raw_arguments.is_empty() {
+        Value::Object(Default::default())
     } else {
-        shortened
+        serde_json::from_str(raw_arguments).unwrap_or(Value::Object(Default::default()))
+    };
+
+    Some((tool_name.to_string(), arguments))
+}
+
+fn infer_tool_request(input: &str, tools: &[Tool]) -> Option<(String, Value, String)> {
+    if let Some((tool_name, arguments)) = parse_explicit_tool_request(input) {
+        return Some((
+            tool_name.clone(),
+            arguments,
+            format!("Explicit tool request detected for `{tool_name}`."),
+        ));
     }
-}
 
-fn chat_help_text(bin_name: &str) -> String {
-    format!(
-        "Start an interactive ingress CLI session.\n\n\
-Usage:\n  {bin_name} chat\n  {bin_name} chat --system <prompt> --trace\n\n\
-Developer notes:\n  - This mode keeps the main agent in a persistent wait loop until new context arrives.\n  - Repo and workspace markdown plus persisted conversation history are compacted into the planner context.\n  - If `OPENAI_API_KEY` is set, the agent keeps multi-turn history locally and sends it to the OpenAI planner on each turn.\n  - `/trace` toggles execution trace output while the session is running.\n  - `/system`, `/tools`, and `/skills` inspect the active agent configuration.\n\n\
-In-session commands:\n  /help    Show chat help.\n  /system  Show the active system prompt.\n  /tools   Show available tools.\n  /skills  Show available skills.\n  /trace   Toggle execution trace output.\n  /exit    Leave the chat session.\n"
-    )
-}
-
-fn print_run_result(result: &AgentResult, show_trace: bool, show_reasoning: bool) {
-    println!("Status: {:?}", result.status);
-    if show_reasoning && !result.reasoning.is_empty() {
-        println!("Reasoning:");
-        for step in &result.reasoning {
-            println!("- {step}");
-        }
+    if tools.iter().any(|tool| tool.is_named("web_search")) && should_use_web_search(input) {
+        return Some((
+            "web_search".to_string(),
+            Value::Object(Default::default()),
+            "Planner inferred `web_search` for an external or time-sensitive query.".to_string(),
+        ));
     }
-    println!("Output: {}", result.output);
 
-    if show_trace {
-        println!("Trace:");
-        for step in &result.trace {
-            println!("- {step}");
-        }
+    None
+}
+
+fn should_use_web_search(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
     }
-}
 
-#[derive(Debug, Clone)]
-enum Decision {
-    CallTool {
-        tool_name: String,
-        arguments: Value,
-        reason: String,
-    },
-    CallSkill(String, String),
-    Retry(String),
-    Finish(String, String),
-    Stop(String),
-}
+    let lower = trimmed.to_ascii_lowercase();
 
-struct PlannerRun {
-    decision: Decision,
-    reasoning: Vec<String>,
-}
-
-impl PlannerRun {
-    fn new(decision: Decision) -> Self {
-        Self {
-            decision,
-            reasoning: Vec::new(),
-        }
+    let explicit_phrases = [
+        "search the web",
+        "search web",
+        "web search",
+        "look up",
+        "lookup",
+        "research ",
+        "find online",
+        "on the web",
+        "perplexity",
+    ];
+    if explicit_phrases.iter().any(|phrase| lower.contains(phrase)) {
+        return true;
     }
+
+    let recency_signals = [
+        "latest",
+        "current",
+        "today",
+        "recent",
+        "recently",
+        "newest",
+        "up-to-date",
+        "up to date",
+        "breaking",
+        "news",
+    ];
+    let knowledge_targets = [
+        "docs",
+        "documentation",
+        "release notes",
+        "announcement",
+        "announcements",
+        "pricing",
+        "price",
+        "api",
+        "api changes",
+        "version",
+        "versions",
+        "model",
+        "models",
+        "policy",
+        "policies",
+    ];
+
+    recency_signals.iter().any(|signal| lower.contains(signal))
+        && knowledge_targets
+            .iter()
+            .any(|target| lower.contains(target))
 }
 
-impl fmt::Display for Decision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Decision::CallTool {
-                tool_name, reason, ..
-            } => write!(f, "call tool `{tool_name}` ({reason})"),
-            Decision::CallSkill(name, reason) => write!(f, "call skill `{name}` ({reason})"),
-            Decision::Retry(reason) => write!(f, "retry ({reason})"),
-            Decision::Finish(answer, reason) => write!(f, "finish ({reason}; {answer})"),
-            Decision::Stop(reason) => write!(f, "stop ({reason})"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum StepOutcome {
-    Success(String),
-    Retry(String),
-}
-
-impl fmt::Display for StepOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StepOutcome::Success(output) => write!(f, "success ({output})"),
-            StepOutcome::Retry(reason) => write!(f, "retry ({reason})"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AgentResult {
-    pub status: RunStatus,
-    pub output: String,
-    pub trace: Vec<String>,
-    pub reasoning: Vec<String>,
-}
-
-impl AgentResult {
-    fn completed(output: String, trace: Vec<String>) -> Self {
-        let reasoning = collect_reasoning_messages(&trace);
-        Self {
-            status: RunStatus::Completed,
-            output,
-            trace,
-            reasoning,
+fn infer_subagent_name<'a>(
+    input: &str,
+    subagents: &'a BTreeMap<String, SubagentSpec>,
+) -> Option<String> {
+    let lower = input.to_ascii_lowercase();
+    if let Some(explicit) = lower.strip_prefix("use agent ") {
+        let name = explicit
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if subagents.contains_key(name) {
+            return Some(name.to_string());
         }
     }
 
-    fn stopped(trace: Vec<String>) -> Self {
-        let reasoning = collect_reasoning_messages(&trace);
-        Self {
-            status: RunStatus::Stopped,
-            output: "Stopped after reaching retry limit or explicit stop condition.".to_string(),
-            trace,
-            reasoning,
-        }
+    if lower.contains("plan") && subagents.contains_key("plan") {
+        return Some("plan".to_string());
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RunStatus {
-    Completed,
-    Stopped,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MessageRole {
-    User,
-    Assistant,
-}
-
-impl MessageRole {
-    fn as_api_role(&self) -> &'static str {
-        match self {
-            MessageRole::User => "user",
-            MessageRole::Assistant => "assistant",
-        }
+    if (lower.contains("explore")
+        || lower.contains("investigate")
+        || lower.contains("find ")
+        || lower.contains("where "))
+        && subagents.contains_key("explore")
+    {
+        return Some("explore".to_string());
     }
+    if subagents.contains_key("general-purpose") {
+        return Some("general-purpose".to_string());
+    }
+    subagents.keys().next().cloned()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationMessage {
-    role: MessageRole,
-    content: String,
-}
-
-impl ConversationMessage {
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
-            content: content.into(),
+fn heuristic_plan(
+    input: &str,
+    tools: &[Tool],
+    subagents: &BTreeMap<String, SubagentSpec>,
+    observations: &[String],
+) -> PlannerRun {
+    if let Some(observation) = observations.last() {
+        if observation.starts_with("Recoverable ") || observation.starts_with("Planner retry request:") {
+            return PlannerRun {
+                decision: Decision::Retry(
+                    "the latest observation still reflects a recoverable failure".to_string(),
+                ),
+                reasoning: vec![
+                    "The heuristic router preserves retry semantics when the latest observation is a recoverable failure."
+                        .to_string(),
+                ],
+                usage: None,
+            };
         }
+
+        return PlannerRun {
+            decision: Decision::Finish {
+                answer: observation.clone(),
+                reason: "the latest observation is now the best available answer".to_string(),
+            },
+            reasoning: vec![
+                "The heuristic router finishes after a successful observation instead of taking another action."
+                    .to_string(),
+            ],
+            usage: None,
+        };
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content: content.into(),
-        }
+    if let Some((tool_name, arguments, route_reason)) = infer_tool_request(input, tools) {
+        return PlannerRun {
+            decision: Decision::CallTool {
+                tool_name,
+                arguments,
+                reason: route_reason.clone(),
+            },
+            reasoning: vec![route_reason],
+            usage: None,
+        };
+    }
+
+    let subagent_name =
+        infer_subagent_name(input, subagents).unwrap_or_else(|| "general-purpose".to_string());
+    PlannerRun {
+        decision: Decision::DelegateSubagent {
+            subagent_name,
+            reason: "No explicit tool request was inferred.".to_string(),
+        },
+        reasoning: vec![
+            "No model-backed planner succeeded; using the local heuristic router.".to_string()
+        ],
+        usage: None,
     }
 }
 
@@ -1654,179 +1600,55 @@ impl OpenAiEngine {
         &self,
         config: &AgentConfig,
         tools: &[Tool],
-        skills: &[Skill],
-        history: &[ConversationMessage],
-        state: &AgentState,
+        subagents: &BTreeMap<String, SubagentSpec>,
+        state: &SessionState,
         user_input: &str,
-        observer: Option<&mut dyn StreamObserver>,
-        observability: &Observability,
+        task_contract: &TaskContract,
+        observations: &[String],
+        retry_count: u8,
     ) -> Result<PlannerRun, String> {
-        observability.with_span(
-            "openai.plan",
-            vec![
-                KeyValue::new("langsmith.span.kind", "llm"),
-                KeyValue::new("gen_ai.system", "OpenAI"),
-                KeyValue::new("gen_ai.operation.name", "chat"),
-                KeyValue::new("gen_ai.request.model", self.model.clone()),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(user_input, 1_500),
-                ),
-            ],
-            || {
-                let request = json!({
-                    "model": self.model,
-                    "instructions": config.system_prompt,
-                    "input": build_planner_input(history, user_input, state, tools, skills),
-                    "stream": true,
-                    "reasoning": {
-                        "summary": "auto"
-                    },
-                    "text": {
-                        "format": {
-                            "type": "json_schema",
-                            "name": "agent_decision",
-                            "strict": true,
-                            "schema": planner_schema()
-                        }
-                    }
-                });
-
-                let response = self.send_streaming_request(request, observer)?;
-                let raw_text = response
-                    .response
-                    .output_text()
-                    .ok_or_else(|| "OpenAI response did not contain text output.".to_string())?;
-                let payload: PlannerPayload = serde_json::from_str(&raw_text)
-                    .map_err(|error| format!("Planner JSON parse failed: {error}; raw={raw_text}"))?;
-                Observability::set_attributes(vec![
-                    KeyValue::new("gen_ai.response.model", self.model.clone()),
-                    KeyValue::new(
-                        "output.value",
-                        observability::compact_text(&raw_text, 2_000),
-                    ),
-                ]);
-                Observability::set_status_ok();
-
-                Ok(PlannerRun {
-                    decision: planner_payload_to_decision(&payload, tools, skills)?,
-                    reasoning: response.reasoning,
-                })
+        let request = json!({
+            "model": self.model,
+            "instructions": config.system_prompt,
+            "input": build_planner_input(
+                state,
+                user_input,
+                tools,
+                subagents,
+                task_contract,
+                observations,
+                retry_count,
+            ),
+            "reasoning": {
+                "summary": "auto"
             },
-        )
-    }
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "agent_decision",
+                    "strict": true,
+                    "schema": planner_schema()
+                }
+            }
+        });
 
-    fn execute_skill(
-        &self,
-        skill_name: &str,
-        skill_description: &str,
-        loaded_skill: &LoadedInstalledSkill,
-        workspace_markdown_context: &str,
-        history: &[ConversationMessage],
-        user_input: &str,
-        system_prompt: &str,
-        recent_trace: &str,
-        observability: &Observability,
-    ) -> Result<String, String> {
-        observability.with_span(
-            format!("openai.skill.{skill_name}"),
-            vec![
-                KeyValue::new("langsmith.span.kind", "llm"),
-                KeyValue::new("gen_ai.system", "OpenAI"),
-                KeyValue::new("gen_ai.operation.name", "chat"),
-                KeyValue::new("gen_ai.request.model", self.model.clone()),
-                KeyValue::new("skill.name", skill_name.to_string()),
-                KeyValue::new(
-                    "input.value",
-                    observability::compact_text(user_input, 1_500),
-                ),
-            ],
-            || {
-                let mut input = vec![ApiInputMessage {
-                    role: "developer".to_string(),
-                    content: format!(
-                        "You are executing an installed Claude-style skill for a Rust agent.\n\
-Follow the skill instructions closely and answer the user's request directly.\n\
-Do not mention internal planner mechanics unless the user asks.\n\
-\n\
-Skill name: {skill_name}\n\
-Skill description: {skill_description}\n\
-Skill directory: {}\n\
-Bundled resources: {}\n\
-\n\
-Recent trace:\n{recent_trace}\n\
-\n\
-Repo and workspace markdown context:\n{workspace_markdown_context}\n\
-\n\
-SKILL.md:\n{}",
-                        loaded_skill.directory.display(),
-                        loaded_skill.resource_summary(),
-                        loaded_skill.markdown
-                    ),
-                }];
+        let response = self.send_json_request(request)?;
+        let raw_text = response
+            .output_text()
+            .ok_or_else(|| "OpenAI response did not contain text output.".to_string())?;
+        let payload: PlannerPayload = serde_json::from_str(&raw_text)
+            .map_err(|error| format!("Planner JSON parse failed: {error}; raw={raw_text}"))?;
+        let decision = planner_payload_to_decision(&payload, tools, subagents)?;
+        let reasoning = vec![reasoning_summary_for_decision(&decision)];
 
-                input.extend(history.iter().map(|message| ApiInputMessage {
-                    role: message.role.as_api_role().to_string(),
-                    content: message.content.clone(),
-                }));
-
-                input.push(ApiInputMessage {
-                    role: "user".to_string(),
-                    content: user_input.to_string(),
-                });
-
-                let request = json!({
-                    "model": self.model,
-                    "instructions": system_prompt,
-                    "input": input,
-                });
-
-                let response = self.send_json_request(request)?;
-                let output = response.output_text().ok_or_else(|| {
-                    format!("OpenAI skill execution for `{skill_name}` returned no text output.")
-                })?;
-                Observability::set_attributes(vec![
-                    KeyValue::new("gen_ai.response.model", self.model.clone()),
-                    KeyValue::new(
-                        "output.value",
-                        observability::compact_text(&output, 2_000),
-                    ),
-                ]);
-                Observability::set_status_ok();
-                Ok(output)
-            },
-        )
-    }
-
-    fn send_streaming_request(
-        &self,
-        request: Value,
-        observer: Option<&mut dyn StreamObserver>,
-    ) -> Result<StreamedOpenAiResponse, String> {
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|error| format!("client build error: {error}"))?;
-
-        let response = client
-            .post(&self.base_url)
-            .bearer_auth(&self.api_key)
-            .header("Accept", "text/event-stream")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .map_err(|error| format!("request error: {error}"))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .text()
-                .map_err(|error| format!("response read error: {error}"))?;
-            return Err(format!("HTTP {}: {}", status.as_u16(), body));
-        }
-
-        parse_streaming_openai_response(BufReader::new(response), observer)
+        Ok(PlannerRun {
+            decision,
+            reasoning,
+            usage: response
+                .usage
+                .as_ref()
+                .map(|usage| usage.as_token_record(&self.model)),
+        })
     }
 
     fn send_json_request(&self, request: Value) -> Result<OpenAiResponse, String> {
@@ -1866,9 +1688,123 @@ SKILL.md:\n{}",
     }
 }
 
-struct StreamedOpenAiResponse {
-    response: OpenAiResponse,
-    reasoning: Vec<String>,
+#[derive(Debug, Clone)]
+struct AnthropicEngine {
+    api_key: String,
+    base_url: String,
+    model: String,
+    version: String,
+}
+
+impl AnthropicEngine {
+    fn from_env() -> Option<Self> {
+        let api_key = env::var("ANTHROPIC_API_KEY").ok()?;
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty()
+            || api_key.starts_with("replace-with-")
+            || api_key.starts_with("your-")
+        {
+            return None;
+        }
+
+        let base_url = env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string());
+        let model = env::var("ANTHROPIC_MODEL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| FALLBACK_MODEL.to_string());
+        let version = env::var("ANTHROPIC_VERSION")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
+
+        Some(Self {
+            api_key,
+            base_url,
+            model,
+            version,
+        })
+    }
+
+    fn plan(
+        &self,
+        config: &AgentConfig,
+        tools: &[Tool],
+        subagents: &BTreeMap<String, SubagentSpec>,
+        state: &SessionState,
+        user_input: &str,
+        task_contract: &TaskContract,
+        observations: &[String],
+        retry_count: u8,
+    ) -> Result<PlannerRun, String> {
+        let prompt = planner_prompt(
+            state,
+            tools,
+            subagents,
+            task_contract,
+            observations,
+            retry_count,
+        );
+        let request = json!({
+            "model": self.model,
+            "max_tokens": 900,
+            "system": format!("{}\n\n{}", config.system_prompt, prompt),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": user_input
+                }
+            ]
+        });
+
+        let response = self.send_json_request(request)?;
+        let raw_text = response
+            .output_text()
+            .ok_or_else(|| "Anthropic response did not contain text output.".to_string())?;
+        let payload: PlannerPayload = serde_json::from_str(&raw_text)
+            .map_err(|error| format!("Planner JSON parse failed: {error}; raw={raw_text}"))?;
+        let decision = planner_payload_to_decision(&payload, tools, subagents)?;
+        let reasoning = vec![reasoning_summary_for_decision(&decision)];
+
+        Ok(PlannerRun {
+            decision,
+            reasoning,
+            usage: response
+                .usage
+                .as_ref()
+                .map(|usage| usage.as_token_record(&self.model)),
+        })
+    }
+
+    fn send_json_request(&self, request: Value) -> Result<AnthropicResponse, String> {
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|error| format!("client build error: {error}"))?;
+
+        let response = client
+            .post(&self.base_url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", &self.version)
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .map_err(|error| format!("request error: {error}"))?;
+
+        let status = response.status();
+        let response_body = response
+            .text()
+            .map_err(|error| format!("response read error: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}: {}", status.as_u16(), response_body));
+        }
+
+        serde_json::from_str(&response_body)
+            .map_err(|error| format!("response JSON parse error: {error}; body={response_body}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1878,6 +1814,7 @@ struct OpenAiResponse {
     #[allow(dead_code)]
     status: Option<String>,
     error: Option<OpenAiErrorBody>,
+    usage: Option<OpenAiUsageBody>,
     #[serde(default)]
     output: Vec<OpenAiOutputItem>,
 }
@@ -1909,12 +1846,30 @@ struct OpenAiErrorBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct OpenAiUsageBody {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+}
+
+impl OpenAiUsageBody {
+    fn as_token_record(&self, model: &str) -> TokenUsageRecord {
+        TokenUsageRecord {
+            actor: "main agent request".to_string(),
+            input_tokens: self.input_tokens.unwrap_or(0),
+            output_tokens: self.output_tokens.unwrap_or(0),
+            total_tokens: self.total_tokens.unwrap_or(0),
+            execution: format!("OpenAI Responses API ({model})"),
+            note: "planner call".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct OpenAiOutputItem {
     #[allow(dead_code)]
     #[serde(rename = "type")]
     item_type: String,
-    #[allow(dead_code)]
-    role: Option<String>,
     #[serde(default)]
     content: Vec<OpenAiContentItem>,
 }
@@ -1927,6 +1882,59 @@ struct OpenAiContentItem {
 }
 
 #[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    usage: Option<AnthropicUsageBody>,
+}
+
+impl AnthropicResponse {
+    fn output_text(&self) -> Option<String> {
+        let text = self
+            .content
+            .iter()
+            .filter(|item| item.content_type == "text")
+            .filter_map(|item| item.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsageBody {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+}
+
+impl AnthropicUsageBody {
+    fn as_token_record(&self, model: &str) -> TokenUsageRecord {
+        let input_tokens = self.input_tokens.unwrap_or(0);
+        let output_tokens = self.output_tokens.unwrap_or(0);
+        TokenUsageRecord {
+            actor: "main agent request".to_string(),
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            execution: format!("Anthropic Messages API ({model})"),
+            note: "fallback planner call".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct PlannerPayload {
     action: String,
     #[serde(default)]
@@ -1934,7 +1942,7 @@ struct PlannerPayload {
     #[serde(default)]
     tool_arguments_json: String,
     #[serde(default)]
-    skill_name: String,
+    subagent_name: String,
     #[serde(default)]
     answer: String,
     #[serde(default)]
@@ -1954,46 +1962,44 @@ fn planner_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["tool", "skill", "retry", "finish", "stop"]
+                "enum": ["tool", "delegate", "finish", "retry", "stop"]
             },
-            "tool_name": {
-                "type": "string"
-            },
-            "tool_arguments_json": {
-                "type": "string"
-            },
-            "skill_name": {
-                "type": "string"
-            },
-            "answer": {
-                "type": "string"
-            },
-            "reason": {
-                "type": "string"
-            }
+            "tool_name": { "type": "string" },
+            "tool_arguments_json": { "type": "string" },
+            "subagent_name": { "type": "string" },
+            "answer": { "type": "string" },
+            "reason": { "type": "string" }
         },
-        "required": ["action", "tool_name", "tool_arguments_json", "skill_name", "answer", "reason"]
+        "required": ["action", "tool_name", "tool_arguments_json", "subagent_name", "answer", "reason"]
     })
 }
 
 fn build_planner_input(
-    history: &[ConversationMessage],
+    state: &SessionState,
     user_input: &str,
-    state: &AgentState,
     tools: &[Tool],
-    skills: &[Skill],
+    subagents: &BTreeMap<String, SubagentSpec>,
+    task_contract: &TaskContract,
+    observations: &[String],
+    retry_count: u8,
 ) -> Vec<ApiInputMessage> {
     let mut messages = vec![ApiInputMessage {
         role: "developer".to_string(),
-        content: planner_prompt(state, tools, skills),
+        content: planner_prompt(
+            state,
+            tools,
+            subagents,
+            task_contract,
+            observations,
+            retry_count,
+        ),
     }];
-    messages.push(ApiInputMessage {
-        role: "developer".to_string(),
-        content: render_compact_runtime_context(history),
-    });
 
-    messages.extend(history.iter().map(|message| ApiInputMessage {
-        role: message.role.as_api_role().to_string(),
+    messages.extend(state.history.iter().map(|message| ApiInputMessage {
+        role: match message.role {
+            MessageRole::User => "user".to_string(),
+            MessageRole::Assistant => "assistant".to_string(),
+        },
         content: message.content.clone(),
     }));
 
@@ -2005,48 +2011,90 @@ fn build_planner_input(
     messages
 }
 
-fn planner_prompt(state: &AgentState, tools: &[Tool], skills: &[Skill]) -> String {
+fn planner_prompt(
+    state: &SessionState,
+    tools: &[Tool],
+    subagents: &BTreeMap<String, SubagentSpec>,
+    task_contract: &TaskContract,
+    observations: &[String],
+    retry_count: u8,
+) -> String {
     let tool_list = tools
         .iter()
-        .map(|tool| tool.planner_description().to_string())
+        .map(|tool| format!("- {}", tool.planner_description()))
         .collect::<Vec<_>>()
         .join("\n");
-    let skill_list = skills
-        .iter()
-        .map(|skill| format!("{}: {}", skill.name(), skill.description()))
+    let subagent_list = subagents
+        .values()
+        .map(|spec| format!("- {}: {}", spec.name, spec.description))
         .collect::<Vec<_>>()
         .join("\n");
+    let history_summary = compact_history(&state.history);
+    let observation_summary = if observations.is_empty() {
+        "No observations recorded yet.".to_string()
+    } else {
+        observations
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|item| observability::compact_text(item, 220))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
-        "You are the planner for a Rust ingress and data-ingestion agent. Choose exactly one next action.\n\
-Return JSON only matching the required schema.\n\
+        "You are the planner for a harness-first Rust coding agent.\n\
+Choose exactly one next action and return JSON only.\n\
 Rules:\n\
-- The default operational path is ingress: for any non-empty inbound message that is not an explicit developer request to use another tool or skill, choose action=`tool` with `tool_name`=`queue_ingress`.\n\
-- Choose action=`tool` only when one of the listed tools should be executed now.\n\
-- For action=`tool`, set `tool_name` to the exact tool identifier from the list and set `tool_arguments_json` to a compact JSON string encoding an object that matches the described input shape. Use `{{}}` when no arguments are needed.\n\
-- Choose action=`skill` only when one of the listed skills should be executed now.\n\
-- Choose action=`retry` only for recoverable errors or when another attempt is required.\n\
-- Choose action=`stop` for explicit stop conditions such as empty input or retry exhaustion.\n\
-- Otherwise choose action=`finish` and put the full assistant reply in `answer`.\n\
-- When action is not `tool`, leave `tool_name` as an empty string.\n\
-- When action is not `tool`, leave `tool_arguments_json` as `\"{{}}\"`.\n\
-- When action is not `skill`, leave `skill_name` as an empty string.\n\
-- When action is not `finish`, leave `answer` as an empty string.\n\
-- Always fill `reason` with a short explanation.\n\
-- Available tools:\n{tool_list}\n\
-- Available skills:\n{skill_list}\n\
-- Current retry count: {}/{}\n\
-- Recent trace:\n{}\n",
-        state.retries,
-        MAX_RETRIES,
-        state.recent_trace(10)
+- Start from the explicit task contract.\n\
+- The harness loop permits exactly one action per iteration.\n\
+- Prefer calling a tool when the user's request requires an available tool now.\n\
+- Prefer delegating to a subagent when the request is exploratory, planning-oriented, or file-focused.\n\
+- Prefer `finish` when the latest observation already contains enough information to answer.\n\
+- Use `retry` only for recoverable failures that gained new information.\n\
+- Use action=`finish` when you can answer directly without a tool or subagent.\n\
+- Use action=`stop` only for terminal conditions.\n\
+- For action=`tool`, set `tool_name` exactly and encode an object in `tool_arguments_json`.\n\
+- For action=`delegate`, set `subagent_name` exactly.\n\
+- When a field does not apply, leave it empty, except `tool_arguments_json`, which must be `{{}}`.\n\
+- Fill `reason` with a short explanation.\n\
+\n\
+Available tools:\n{tool_list}\n\
+\n\
+Available subagents:\n{subagent_list}\n\
+\n\
+Task contract:\n\
+- goal: {}\n\
+- constraints: {}\n\
+- acceptance criteria: {}\n\
+- relevant files: {}\n\
+- stop condition: {}\n\
+\n\
+Retry count: {retry_count}\n\
+\n\
+Recorded observations:\n{observation_summary}\n\
+\n\
+Compacted prior history:\n{history_summary}\n"
+        ,
+        task_contract.goal,
+        task_contract.constraints.join(" | "),
+        task_contract.acceptance_criteria.join(" | "),
+        if task_contract.relevant_files.is_empty() {
+            "none inferred".to_string()
+        } else {
+            task_contract.relevant_files.join(", ")
+        },
+        task_contract.stop_condition,
     )
 }
 
 fn planner_payload_to_decision(
     payload: &PlannerPayload,
     tools: &[Tool],
-    skills: &[Skill],
+    subagents: &BTreeMap<String, SubagentSpec>,
 ) -> Result<Decision, String> {
     let reason = empty_to_default(&payload.reason, "planner did not provide a reason");
     match payload.action.as_str() {
@@ -2058,33 +2106,52 @@ fn planner_payload_to_decision(
             if !tools.iter().any(|tool| tool.is_named(&tool_name)) {
                 return Err(format!("Planner requested unknown tool `{tool_name}`"));
             }
-
-            let arguments = parse_planner_tool_arguments(&payload.tool_arguments_json, &tool_name)?;
-
             Ok(Decision::CallTool {
-                tool_name,
-                arguments,
+                tool_name: tool_name.clone(),
+                arguments: parse_planner_tool_arguments(&payload.tool_arguments_json, &tool_name)?,
                 reason,
             })
         }
-        "skill" => {
-            let skill_name = empty_to_default(&payload.skill_name, "");
-            if skill_name.is_empty() {
-                return Err("Planner requested a skill without `skill_name`.".to_string());
+        "delegate" => {
+            let subagent_name = empty_to_default(&payload.subagent_name, "");
+            if subagent_name.is_empty() {
+                return Err("Planner requested delegation without `subagent_name`.".to_string());
             }
-            if !skills.iter().any(|skill| skill.is_named(&skill_name)) {
-                return Err(format!("Planner requested unknown skill `{skill_name}`"));
+            if !subagents.contains_key(&subagent_name) {
+                return Err(format!(
+                    "Planner requested unknown subagent `{subagent_name}`"
+                ));
             }
-            Ok(Decision::CallSkill(skill_name, reason))
+            Ok(Decision::DelegateSubagent {
+                subagent_name,
+                reason,
+            })
         }
-        "retry" => Ok(Decision::Retry(reason)),
-        "finish" => Ok(Decision::Finish(
-            empty_to_default(&payload.answer, "The model returned an empty answer."),
+        "finish" => Ok(Decision::Finish {
+            answer: empty_to_default(&payload.answer, "The model returned an empty answer."),
             reason,
-        )),
+        }),
+        "retry" => Ok(Decision::Retry(reason)),
         "stop" => Ok(Decision::Stop(reason)),
         other => Err(format!("Planner returned unsupported action `{other}`")),
     }
+}
+
+fn parse_planner_tool_arguments(raw_arguments: &str, tool_name: &str) -> Result<Value, String> {
+    let trimmed = raw_arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+
+    let parsed = serde_json::from_str::<Value>(trimmed).map_err(|error| {
+        format!("Planner tool arguments for `{tool_name}` were not valid JSON: {error}")
+    })?;
+    if !parsed.is_object() {
+        return Err(format!(
+            "Planner tool arguments for `{tool_name}` must decode to a JSON object."
+        ));
+    }
+    Ok(parsed)
 }
 
 fn empty_to_default(value: &str, default: &str) -> String {
@@ -2095,859 +2162,837 @@ fn empty_to_default(value: &str, default: &str) -> String {
     }
 }
 
-fn is_reasoning_model(model: &str) -> bool {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized.starts_with('o') || normalized.contains("reason") || normalized.contains("gpt-5")
-}
-
-fn reasoning_summary_for_decision(decision: &Decision) -> Option<String> {
+fn reasoning_summary_for_decision(decision: &Decision) -> String {
     match decision {
         Decision::CallTool {
             tool_name, reason, ..
-        } => Some(format!("Using tool `{tool_name}` because {reason}")),
-        Decision::CallSkill(name, reason) => Some(format!("Using skill `{name}` because {reason}")),
-        Decision::Retry(reason) => Some(format!("Retry requested because {reason}")),
-        Decision::Finish(_, reason) => Some(format!("Answering directly because {reason}")),
-        Decision::Stop(reason) => Some(format!("Stopping because {reason}")),
-    }
-}
-
-fn record_reasoning_summary(
-    state: &mut AgentState,
-    config: &AgentConfig,
-    decision: &Decision,
-    streamed_reasoning: &[String],
-) {
-    if !streamed_reasoning.is_empty() {
-        for summary in streamed_reasoning {
-            state.record(format!("Reasoning: {summary}"));
+        } => format!("The planner chose tool `{tool_name}` because {reason}"),
+        Decision::DelegateSubagent {
+            subagent_name,
+            reason,
+        } => format!("The planner delegated to `{subagent_name}` because {reason}"),
+        Decision::Finish { reason, .. } => {
+            format!("The planner answered directly because {reason}")
         }
-        return;
-    }
-
-    let Some(model) = config.planner_model.as_deref() else {
-        return;
-    };
-
-    if !is_reasoning_model(model) {
-        return;
-    }
-
-    if let Some(summary) = reasoning_summary_for_decision(decision) {
-        state.record(format!("Reasoning: {summary}"));
+        Decision::Retry(reason) => format!("The planner requested a retry because {reason}"),
+        Decision::Stop(reason) => format!("The planner stopped because {reason}"),
     }
 }
 
-fn collect_reasoning_messages(trace: &[String]) -> Vec<String> {
-    trace
+fn execute_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+    match spec.name.as_str() {
+        "explore" => execute_explore_subagent(spec, request),
+        "plan" => execute_plan_subagent(spec, request),
+        _ => execute_general_subagent(spec, request),
+    }
+}
+
+fn execute_explore_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+    let files = if request.file_refs.is_empty() {
+        vec!["No matching files were inferred.".to_string()]
+    } else {
+        request.file_refs.clone()
+    };
+    let findings = files
         .iter()
-        .filter_map(|entry| entry.strip_prefix("Reasoning: ").map(str::to_string))
+        .map(|path| format!("Potentially relevant file: {path}"))
+        .collect::<Vec<_>>();
+    DelegationResult {
+        summary: format!("{} narrowed the task to likely files.", spec.name),
+        findings: findings.clone(),
+        artifact_refs: files.clone(),
+        recommended_next_action: if files.is_empty() {
+            "Clarify the task or cite exact files.".to_string()
+        } else {
+            "Use `/agent plan ...` once the target files are confirmed.".to_string()
+        },
+        final_text: format!(
+            "Explore agent\nTask: {}\n\nContext packet goal: {}\n\nRecommended files:\n{}",
+            request.task,
+            request.context_packet.goal,
+            findings
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        usage: vec![TokenUsageRecord::zero(
+            format!("subagent `{}`", spec.name),
+            "local synthesized subagent",
+            "no model API call",
+        )],
+    }
+}
+
+fn execute_plan_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+    let steps = vec![
+        format!("Load only the files relevant to `{}`.", request.task),
+        "Make the smallest coherent change set that matches project memory and commands."
+            .to_string(),
+        "Verify with targeted tests and finish with a review-oriented summary.".to_string(),
+    ];
+    let artifact_refs = request
+        .file_refs
+        .into_iter()
+        .take(MAX_RELEVANT_FILES)
+        .collect::<Vec<_>>();
+    DelegationResult {
+        summary: format!("{} produced a compact execution plan.", spec.name),
+        findings: steps.clone(),
+        artifact_refs,
+        recommended_next_action: "Execute the plan or run `/review` after implementation."
+            .to_string(),
+        final_text: format!(
+            "Plan agent\nTask: {}\n\nPlan:\n{}",
+            request.task,
+            steps
+                .iter()
+                .map(|step| format!("- {step}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        usage: vec![TokenUsageRecord::zero(
+            format!("subagent `{}`", spec.name),
+            "local synthesized subagent",
+            "no model API call",
+        )],
+    }
+}
+
+fn execute_general_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+    let findings = vec![
+        format!("Active task: {}", request.task),
+        format!("Loaded memory sources: {}", request.memory_refs.len()),
+        format!("Relevant files inferred: {}", request.file_refs.len()),
+    ];
+    DelegationResult {
+        summary: format!("{} returned a compact handoff.", spec.name),
+        findings: findings.clone(),
+        artifact_refs: request.file_refs.clone(),
+        recommended_next_action:
+            "Refine the task, delegate to `/agent plan ...`, or call an explicit tool if needed."
+                .to_string(),
+        final_text: format!(
+            "General-purpose agent\nTask: {}\n\nKnown facts:\n{}\n\nPrompt excerpt:\n{}",
+            request.task,
+            request
+                .context_packet
+                .known_facts
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            observability::compact_text(&spec.prompt, 320)
+        ),
+        usage: vec![TokenUsageRecord::zero(
+            format!("subagent `{}`", spec.name),
+            "local synthesized subagent",
+            "no model API call",
+        )],
+    }
+}
+
+fn usage_trace_lines(records: &[TokenUsageRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|record| format!("Token usage: {}", record.trace_line()))
         .collect()
 }
 
-fn reborrow_observer<'a>(
-    observer: &'a mut Option<&mut dyn StreamObserver>,
-) -> Option<&'a mut dyn StreamObserver> {
-    match observer {
-        Some(observer) => Some(&mut **observer),
-        None => None,
+fn render_usage_summary(records: &[TokenUsageRecord]) -> String {
+    if records.is_empty() {
+        return "Token usage\n- none recorded".to_string();
+    }
+
+    let mut lines = vec!["Token usage".to_string()];
+    lines.extend(records.iter().map(TokenUsageRecord::summary_line));
+    lines.join("\n")
+}
+
+fn record_usage_observability(records: &[TokenUsageRecord]) {
+    for record in records {
+        Observability::record_event(
+            "token_usage",
+            vec![
+                KeyValue::new("usage.actor", record.actor.clone()),
+                KeyValue::new("usage.execution", record.execution.clone()),
+                KeyValue::new("usage.input_tokens", i64::from(record.input_tokens)),
+                KeyValue::new("usage.output_tokens", i64::from(record.output_tokens)),
+                KeyValue::new("usage.total_tokens", i64::from(record.total_tokens)),
+                KeyValue::new("usage.note", record.note.clone()),
+            ],
+        );
     }
 }
 
-fn build_root_span_attributes(
-    config: &AgentConfig,
-    history: &[ConversationMessage],
-    user_input: &str,
-    enabled_targets: &[&'static str],
-) -> Vec<KeyValue> {
-    vec![
-        KeyValue::new("langsmith.trace.name", "main_agent.run"),
-        KeyValue::new("langsmith.span.kind", "chain"),
-        KeyValue::new("langsmith.trace.session_name", "agent_in_rust"),
-        KeyValue::new("langfuse.trace.name", "main_agent.run"),
-        KeyValue::new(
-            "agent.observability.targets",
-            enabled_targets.join(","),
-        ),
-        KeyValue::new("agent.default_model", config.default_model.to_string()),
-        KeyValue::new("agent.fallback_model", config.fallback_model.to_string()),
-        KeyValue::new("agent.history_count", history.len() as i64),
-        KeyValue::new(
-            "input.value",
-            observability::compact_text(user_input, 2_000),
-        ),
-    ]
+fn compact_history(history: &[ConversationMessage]) -> String {
+    if history.is_empty() {
+        return "No prior session history was available.".to_string();
+    }
+
+    history
+        .iter()
+        .rev()
+        .take(MAX_COMPACTED_HISTORY_ITEMS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|message| {
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+            };
+            format!(
+                "{role}: {}",
+                observability::compact_text(&message.content, 120)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
-fn record_decision_event(decision: &Decision, reasoning: &[String]) {
-    let mut attributes = vec![
-        KeyValue::new("planner.decision", decision.to_string()),
-        KeyValue::new("planner.reasoning_count", reasoning.len() as i64),
-    ];
-    if !reasoning.is_empty() {
-        attributes.push(KeyValue::new(
-            "planner.reasoning",
-            observability::compact_text(&reasoning.join(" | "), 2_000),
-        ));
-    }
-    Observability::record_event("planner.decision", attributes);
-}
+fn load_memory_stack(root_dir: &Path, home_dir: Option<&Path>) -> io::Result<MemoryStack> {
+    let mut sources = Vec::new();
+    let mut visited = BTreeSet::new();
 
-fn record_step_outcome(kind: &str, outcome: &StepOutcome) {
-    match outcome {
-        StepOutcome::Success(output) => {
-            Observability::set_attributes(vec![KeyValue::new(
-                "output.value",
-                observability::compact_text(output, 2_000),
-            )]);
-            Observability::record_event(
-                format!("{kind}.success"),
-                vec![KeyValue::new(
-                    format!("{kind}.output"),
-                    observability::compact_text(output, 2_000),
-                )],
-            );
-            Observability::set_status_ok();
-        }
-        StepOutcome::Retry(reason) => {
-            Observability::record_event(
-                format!("{kind}.retry"),
-                vec![KeyValue::new(
-                    format!("{kind}.retry_reason"),
-                    observability::compact_text(reason, 2_000),
-                )],
-            );
-            Observability::set_status_error(reason.clone());
-        }
-    }
-}
-
-fn parse_streaming_openai_response<R: BufRead>(
-    mut reader: R,
-    mut observer: Option<&mut dyn StreamObserver>,
-) -> Result<StreamedOpenAiResponse, String> {
-    let mut line = String::new();
-    let mut event_name: Option<String> = None;
-    let mut data_lines: Vec<String> = Vec::new();
-    let mut reasoning_summaries: BTreeMap<usize, String> = BTreeMap::new();
-    let mut completed_response: Option<OpenAiResponse> = None;
-
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("response stream read error: {error}"))?;
-
-        if bytes_read == 0 {
-            if !data_lines.is_empty() {
-                process_stream_event(
-                    &event_name,
-                    &data_lines,
-                    &mut reasoning_summaries,
-                    reborrow_observer(&mut observer),
-                    &mut completed_response,
-                )?;
-            }
-            break;
-        }
-
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            if !data_lines.is_empty() {
-                process_stream_event(
-                    &event_name,
-                    &data_lines,
-                    &mut reasoning_summaries,
-                    reborrow_observer(&mut observer),
-                    &mut completed_response,
-                )?;
-                event_name = None;
-                data_lines.clear();
-            }
-            continue;
-        }
-
-        if let Some(value) = trimmed.strip_prefix("event:") {
-            event_name = Some(value.trim().to_string());
-            continue;
-        }
-
-        if let Some(value) = trimmed.strip_prefix("data:") {
-            data_lines.push(value.trim_start().to_string());
-        }
+    if let Some(home_dir) = home_dir {
+        let user_memory = home_dir.join(CLAUDE_DIR).join(PROJECT_MEMORY_FILE);
+        load_memory_source(
+            &user_memory,
+            MemoryScope::User,
+            None,
+            0,
+            &mut visited,
+            &mut sources,
+        )?;
     }
 
-    let response = completed_response.ok_or_else(|| {
-        "OpenAI response stream ended before a `response.completed` event arrived.".to_string()
-    })?;
+    let project_memory = root_dir.join(PROJECT_MEMORY_FILE);
+    load_memory_source(
+        &project_memory,
+        MemoryScope::Project,
+        None,
+        0,
+        &mut visited,
+        &mut sources,
+    )?;
 
-    if let Some(error) = &response.error {
-        return Err(format!(
-            "{}: {}",
-            error.code.as_deref().unwrap_or("api_error"),
-            error.message
-        ));
-    }
+    let merged_instructions = sources
+        .iter()
+        .map(|source| {
+            format!(
+                "[{}] {}\n{}",
+                source.scope,
+                source.path.display(),
+                source.contents.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
-    Ok(StreamedOpenAiResponse {
-        response,
-        reasoning: reasoning_summaries.into_values().collect(),
+    Ok(MemoryStack {
+        sources,
+        merged_instructions,
     })
 }
 
-fn process_stream_event(
-    event_name: &Option<String>,
-    data_lines: &[String],
-    reasoning_summaries: &mut BTreeMap<usize, String>,
-    observer: Option<&mut dyn StreamObserver>,
-    completed_response: &mut Option<OpenAiResponse>,
-) -> Result<(), String> {
-    let data = data_lines.join("\n");
-    if data == "[DONE]" {
+fn load_memory_source(
+    path: &Path,
+    scope: MemoryScope,
+    imported_from: Option<PathBuf>,
+    depth: usize,
+    visited: &mut BTreeSet<PathBuf>,
+    sources: &mut Vec<MemorySource>,
+) -> io::Result<()> {
+    if !path.is_file() || depth > MAX_IMPORT_DEPTH {
         return Ok(());
     }
 
-    let payload: Value = serde_json::from_str(&data)
-        .map_err(|error| format!("stream event JSON parse error: {error}; data={data}"))?;
-    let event_type = event_name
-        .as_deref()
-        .or_else(|| payload.get("type").and_then(Value::as_str))
-        .unwrap_or_default();
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical.clone()) {
+        return Ok(());
+    }
 
-    match event_type {
-        "response.reasoning_summary_text.delta" => {
-            let index = payload
-                .get("summary_index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            let delta = payload
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            reasoning_summaries
-                .entry(index)
-                .or_default()
-                .push_str(delta);
-            if let Some(observer) = observer {
-                observer.on_reasoning_delta(delta);
-            }
-        }
-        "response.reasoning_summary_text.done" => {
-            let index = payload
-                .get("summary_index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            let text = payload
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            reasoning_summaries.insert(index, text.clone());
-            if let Some(observer) = observer {
-                observer.on_reasoning_done(&text);
-            }
-        }
-        "response.reasoning_summary_part.done" => {
-            let index = payload
-                .get("summary_index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize;
-            let text = payload
-                .get("part")
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if !text.is_empty() {
-                reasoning_summaries.insert(index, text.clone());
-                if let Some(observer) = observer {
-                    observer.on_reasoning_done(&text);
-                }
-            }
-        }
-        "response.completed" => {
-            let response_value = payload.get("response").cloned().unwrap_or(payload);
-            let parsed: OpenAiResponse = serde_json::from_value(response_value)
-                .map_err(|error| format!("response JSON parse error: {error}"))?;
-            *completed_response = Some(parsed);
-        }
-        "response.failed" => {
-            let response_value = payload.get("response").cloned().unwrap_or(payload.clone());
-            let parsed: OpenAiResponse = serde_json::from_value(response_value)
-                .map_err(|error| format!("failed response JSON parse error: {error}"))?;
-            if let Some(error) = parsed.error {
-                return Err(format!(
-                    "{}: {}",
-                    error.code.as_deref().unwrap_or("api_error"),
-                    error.message
-                ));
-            }
-            return Err("OpenAI response stream failed.".to_string());
-        }
-        "error" => {
-            let message = payload
-                .get("error")
-                .and_then(|value| value.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("message").and_then(Value::as_str))
-                .unwrap_or("OpenAI stream returned an error event.");
-            return Err(message.to_string());
-        }
-        _ => {}
+    let contents = fs::read_to_string(path)?;
+    sources.push(MemorySource {
+        scope: scope.to_string(),
+        path: canonical.clone(),
+        contents: contents.clone(),
+        imported_from: imported_from.clone(),
+    });
+
+    for import_path in extract_imports(&contents, path) {
+        load_memory_source(
+            &import_path,
+            MemoryScope::Imported,
+            Some(canonical.clone()),
+            depth + 1,
+            visited,
+            sources,
+        )?;
     }
 
     Ok(())
 }
 
-fn should_stop_after_retry(state: &mut AgentState, max_retries: u8, reason: &str) -> bool {
-    state.retries += 1;
-    state.record(format!(
-        "Retry attempt {}/{} triggered because: {}",
-        state.retries, max_retries, reason
-    ));
-    state.retries >= max_retries
+fn extract_imports(contents: &str, source_path: &Path) -> Vec<PathBuf> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('@') {
+                return None;
+            }
+            let raw = trimmed.trim_start_matches('@').trim();
+            if raw.is_empty() {
+                return None;
+            }
+            let candidate = PathBuf::from(raw);
+            Some(if candidate.is_absolute() {
+                candidate
+            } else {
+                source_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(candidate)
+            })
+        })
+        .collect()
 }
 
-fn decide_next_step_heuristic(
-    config: &AgentConfig,
-    tools: &[Tool],
-    skills: &[Skill],
-    state: &AgentState,
-    user_input: &str,
-) -> Decision {
-    let input = user_input.trim();
-    let lower = input.to_ascii_lowercase();
+fn load_subagent_specs(
+    root_dir: &Path,
+    home_dir: Option<&Path>,
+) -> io::Result<BTreeMap<String, SubagentSpec>> {
+    let mut entries = BTreeMap::new();
+    if let Some(home_dir) = home_dir {
+        load_subagent_dir(
+            &home_dir.join(CLAUDE_DIR).join(AGENTS_DIR),
+            DefinitionScope::User,
+            &mut entries,
+        )?;
+    }
+    load_subagent_dir(
+        &root_dir.join(CLAUDE_DIR).join(AGENTS_DIR),
+        DefinitionScope::Project,
+        &mut entries,
+    )?;
+    Ok(entries)
+}
 
-    if input.is_empty() {
-        return Decision::Stop("empty user input".to_string());
+fn load_subagent_dir(
+    dir: &Path,
+    scope: DefinitionScope,
+    entries: &mut BTreeMap<String, SubagentSpec>,
+) -> io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
     }
 
-    if state.retries >= config.max_retries {
-        return Decision::Stop("retry limit reached".to_string());
-    }
+    let mut paths = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("md"))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
 
-    if let Some((tool_name, arguments)) = parse_explicit_tool_request(input) {
-        if tools.iter().any(|tool| tool.is_named(&tool_name)) {
-            return Decision::CallTool {
-                tool_name,
-                arguments,
-                reason: "the request explicitly named a tool".to_string(),
-            };
-        }
-    }
-
-    if lower.contains("use skill") || lower.starts_with("skill:") {
-        if let Some(skill_name) = find_skill_name_in_input(skills, &lower) {
-            return Decision::CallSkill(
-                skill_name,
-                "the request explicitly named an installed skill".to_string(),
-            );
-        }
-        if let Some(skill_name) = default_heuristic_skill(skills) {
-            return Decision::CallSkill(
-                skill_name,
-                "the request explicitly asks to use a skill".to_string(),
-            );
-        }
-    }
-
-    if let Some(skill_name) = find_skill_name_in_input(skills, &lower) {
-        return Decision::CallSkill(
-            skill_name,
-            "the request mentions a registered skill by name".to_string(),
+    for path in paths {
+        let contents = fs::read_to_string(&path)?;
+        let (frontmatter, body) = split_frontmatter(&contents);
+        let name = frontmatter
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| file_stem_name(&path));
+        let description = frontmatter
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| "Claude-style delegated subagent.".to_string());
+        let tool_allowlist = frontmatter
+            .get("tools")
+            .and_then(|value| parse_tools_field(value));
+        entries.insert(
+            name.clone(),
+            SubagentSpec {
+                name,
+                description,
+                prompt: body.trim().to_string(),
+                tool_allowlist,
+                scope: scope.to_string(),
+                source_path: path,
+            },
         );
     }
 
-    if lower.contains("retry") && state.retries < config.max_retries {
-        return Decision::Retry("input explicitly requested a retry".to_string());
-    }
-
-    if tools.iter().any(|tool| tool.is_named("queue_ingress")) {
-        return Decision::CallTool {
-            tool_name: "queue_ingress".to_string(),
-            arguments: json!({}),
-            reason: "the main agent acts as the ingress layer and should queue inbound payloads"
-                .to_string(),
-        };
-    }
-
-    Decision::Finish(
-        format!(
-            "Ingress agent received `{}` but no queue_ingress tool is available.",
-            input
-        ),
-        "the ingress queue tool was unavailable".to_string(),
-    )
+    Ok(())
 }
 
-fn default_heuristic_skill(skills: &[Skill]) -> Option<String> {
-    for preferred in ["planner", "summarize", "retry_once"] {
-        if let Some(skill) = skills.iter().find(|skill| skill.is_named(preferred)) {
-            return Some(skill.name().to_string());
-        }
+fn load_custom_commands(
+    root_dir: &Path,
+    home_dir: Option<&Path>,
+) -> io::Result<BTreeMap<String, CustomCommand>> {
+    let mut entries = BTreeMap::new();
+    if let Some(home_dir) = home_dir {
+        load_command_dir(
+            &home_dir.join(CLAUDE_DIR).join(COMMANDS_DIR),
+            DefinitionScope::User,
+            &mut entries,
+        )?;
     }
-
-    skills.first().map(|skill| skill.name().to_string())
+    load_command_dir(
+        &root_dir.join(CLAUDE_DIR).join(COMMANDS_DIR),
+        DefinitionScope::Project,
+        &mut entries,
+    )?;
+    Ok(entries)
 }
 
-fn find_skill_name_in_input(skills: &[Skill], lower_input: &str) -> Option<String> {
-    let mut matches = skills
-        .iter()
-        .filter_map(|skill| {
-            let candidate = skill.name().to_ascii_lowercase();
-            lower_input
-                .contains(&candidate)
-                .then_some((candidate.len(), skill.name().to_string()))
+fn load_command_dir(
+    dir: &Path,
+    scope: DefinitionScope,
+    entries: &mut BTreeMap<String, CustomCommand>,
+) -> io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+
+    let mut paths = fs::read_dir(dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("md"))
+                .unwrap_or(false)
         })
         .collect::<Vec<_>>();
+    paths.sort();
 
-    matches.sort_by(|left, right| right.0.cmp(&left.0));
-    matches.into_iter().next().map(|(_, name)| name)
+    for path in paths {
+        let contents = fs::read_to_string(&path)?;
+        let (frontmatter, body) = split_frontmatter(&contents);
+        let name = frontmatter
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| file_stem_name(&path));
+        let description = frontmatter
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| "Project slash command.".to_string());
+        entries.insert(
+            name.clone(),
+            CustomCommand {
+                name,
+                description,
+                template: body.trim().to_string(),
+                source_path: path,
+                scope: scope.clone(),
+            },
+        );
+    }
+
+    Ok(())
 }
 
-fn parse_explicit_tool_request(user_input: &str) -> Option<(String, Value)> {
-    let trimmed = user_input.trim();
-    let prefixes = ["use tool ", "tool: "];
-    let remainder = prefixes
-        .iter()
-        .find_map(|prefix| {
-            trimmed
-                .to_ascii_lowercase()
-                .strip_prefix(prefix)
-                .map(|_| &trimmed[prefix.len()..])
-        })?
-        .trim();
+fn split_frontmatter(contents: &str) -> (BTreeMap<String, String>, String) {
+    let mut frontmatter = BTreeMap::new();
+    if !contents.starts_with("---\n") {
+        return (frontmatter, contents.to_string());
+    }
 
-    if remainder.is_empty() {
+    let mut sections = contents.splitn(3, "---\n");
+    let _ = sections.next();
+    let Some(frontmatter_body) = sections.next() else {
+        return (frontmatter, contents.to_string());
+    };
+    let Some(body) = sections.next() else {
+        return (frontmatter, contents.to_string());
+    };
+
+    for line in frontmatter_body.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        frontmatter.insert(key.trim().to_string(), value.trim().to_string());
+    }
+
+    (frontmatter, body.to_string())
+}
+
+fn parse_tools_field(value: &str) -> Option<Vec<String>> {
+    let normalized = value
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim();
+    if normalized.is_empty() {
         return None;
     }
 
-    if let Some((tool_name, raw_arguments)) = remainder.split_once(" with ") {
-        let tool_name = tool_name.trim();
-        if tool_name.is_empty() {
-            return None;
+    let items = normalized
+        .split(',')
+        .map(|item| item.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
+    }
+}
+
+fn file_stem_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+fn expand_custom_command(command: &CustomCommand, arguments: &str) -> String {
+    let mut output = command.template.clone();
+    output = output.replace("$ARGUMENTS", arguments.trim());
+    let positional = arguments.split_whitespace().collect::<Vec<_>>();
+    for (index, value) in positional.iter().enumerate() {
+        output = output.replace(&format!("${}", index + 1), value);
+    }
+    output
+}
+
+fn suggest_relevant_files(root_dir: &Path, task: &str) -> Vec<String> {
+    let tokens = task
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        })
+        .filter(|token| token.len() >= 4)
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = collect_candidate_files(root_dir)
+        .into_iter()
+        .filter_map(|path| {
+            let relative = path.strip_prefix(root_dir).unwrap_or(&path).to_path_buf();
+            let display = relative.display().to_string();
+            let lower_path = display.to_ascii_lowercase();
+            let contents = fs::read_to_string(&path).unwrap_or_default();
+            let preview = contents
+                .chars()
+                .take(4_000)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let mut score = 0usize;
+            for token in &tokens {
+                if lower_path.contains(token) {
+                    score += 3;
+                }
+                if preview.contains(token) {
+                    score += 1;
+                }
+            }
+            if score == 0 {
+                None
+            } else {
+                Some((score, display))
+            }
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    scored
+        .into_iter()
+        .take(MAX_RELEVANT_FILES)
+        .map(|(_, path)| path)
+        .collect()
+}
+
+fn collect_candidate_files(root_dir: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    collect_candidate_files_recursive(root_dir, root_dir, &mut results);
+    results
+}
+
+fn collect_candidate_files_recursive(root_dir: &Path, current: &Path, results: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(current) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+
+        if path.is_dir() {
+            if matches!(name, ".git" | "target" | ".venv" | "graphify-out" | "logs") {
+                continue;
+            }
+            collect_candidate_files_recursive(root_dir, &path, results);
+            continue;
         }
-        let arguments = serde_json::from_str::<Value>(raw_arguments.trim()).ok()?;
-        return Some((tool_name.to_string(), normalize_tool_arguments(arguments)));
-    }
 
-    let tool_name = remainder
-        .split_whitespace()
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-
-    Some((tool_name.to_string(), json!({})))
-}
-
-fn normalize_tool_arguments(arguments: Value) -> Value {
-    match arguments {
-        Value::Object(_) => arguments,
-        Value::Null => json!({}),
-        other => json!({ "value": other }),
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| matches!(value, "rs" | "md" | "toml" | "sh" | "json"))
+            .unwrap_or(false)
+        {
+            if path.starts_with(root_dir) {
+                results.push(path);
+            }
+        }
     }
 }
 
-fn parse_planner_tool_arguments(raw: &str, tool_name: &str) -> Result<Value, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(json!({}));
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn scaffold_claude_project(root_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    let files = vec![
+        (root_dir.join(PROJECT_MEMORY_FILE), default_claude_memory()),
+        (
+            root_dir
+                .join(CLAUDE_DIR)
+                .join(AGENTS_DIR)
+                .join("explore.md"),
+            default_explore_agent(),
+        ),
+        (
+            root_dir.join(CLAUDE_DIR).join(AGENTS_DIR).join("plan.md"),
+            default_plan_agent(),
+        ),
+        (
+            root_dir
+                .join(CLAUDE_DIR)
+                .join(AGENTS_DIR)
+                .join("general-purpose.md"),
+            default_general_agent(),
+        ),
+        (
+            root_dir
+                .join(CLAUDE_DIR)
+                .join(COMMANDS_DIR)
+                .join("review.md"),
+            default_review_command(),
+        ),
+    ];
+
+    for (path, contents) in files {
+        if path.exists() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, contents)?;
+        created.push(path);
     }
 
-    let parsed = serde_json::from_str::<Value>(trimmed).map_err(|error| {
-        format!(
-            "Planner returned invalid JSON in `tool_arguments_json` for `{tool_name}`: {error}; raw={trimmed}"
-        )
-    })?;
+    Ok(created)
+}
 
-    match parsed {
-        Value::Object(_) => Ok(parsed),
-        Value::Null => Ok(json!({})),
-        other => Err(format!(
-            "Planner returned non-object JSON in `tool_arguments_json` for `{tool_name}`: {other}"
-        )),
-    }
+fn default_claude_memory() -> &'static str {
+    "# CLAUDE.md\n\nProject memory for the local harness-first runtime.\n\n## Commands\n- `cargo check`\n- `cargo test`\n- `cargo fmt`\n\n## Agent Contract\n- Start every run with an explicit task contract: goal, constraints, acceptance criteria, relevant files, and stop condition.\n- Take exactly one action per loop iteration: call a tool, delegate to a subagent, retry, stop, or finalize.\n- Keep observations explicit between iterations instead of hiding state in prose.\n- Prefer compact context packets and explicit file references over transcript sprawl.\n\n## Working Style\n- Load only the files needed for the current task.\n- Prefer deterministic harness behavior over prompt-only cleverness.\n- Use `/review` after meaningful code changes.\n"
+}
+
+fn default_explore_agent() -> &'static str {
+    "---\nname: explore\ndescription: Inspect code paths, locate files, and return a compact handoff.\ntools: [web_search]\n---\n\n# Explore Agent\n\nStart from the delegated task contract.\nNarrow the task to files, modules, constraints, and missing facts.\nReturn findings, file references, unresolved gaps, and the next practical action.\nDo not sprawl into implementation."
+}
+
+fn default_plan_agent() -> &'static str {
+    "---\nname: plan\ndescription: Produce a compact, decision-complete implementation plan.\n---\n\n# Plan Agent\n\nStart from the delegated task contract.\nTurn the task into a concrete plan with the minimum coherent change set, relevant files, verification steps, risks, and an explicit stop condition."
+}
+
+fn default_general_agent() -> &'static str {
+    "---\nname: general-purpose\ndescription: Handle focused delegated tasks that do not require a specialist.\n---\n\n# General-Purpose Agent\n\nStart from the delegated task contract.\nHandle one bounded delegated task at a time and return what was learned, the concrete artifact or answer, and the recommended next action."
+}
+
+fn default_review_command() -> &'static str {
+    "---\nname: review\ndescription: Run a review-focused workflow over the current task or cited files.\n---\n\nReview this task from an engineering-harness perspective.\nFocus on bugs, regressions, incorrect tool or retry behavior, missing tests, unclear assumptions, and gaps between runtime behavior and durable project memory.\n\n$ARGUMENTS"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Tools::{
-        default_tools, extract_web_search_query, format_perplexity_response, PerplexityResponse,
-    };
-    use std::fs;
-    use std::io::Cursor;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::Tools::default_tools;
 
-    #[test]
-    fn heuristic_queues_plain_inbound_messages_by_default() {
-        let decision = decide_next_step_heuristic(
-            &AgentConfig {
-                system_prompt: "system".to_string(),
-                max_retries: MAX_RETRIES,
-                default_model: DEFAULT_MODEL,
-                fallback_model: FALLBACK_MODEL,
-                planner_model: None,
+    fn temp_root(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("{label}-{}", now_epoch_ms()));
+        fs::create_dir_all(&path).expect("temp dir should exist");
+        path
+    }
+
+    fn test_agent(root_dir: PathBuf) -> MainAgent {
+        let mut subagents = BTreeMap::new();
+        subagents.insert(
+            "general-purpose".to_string(),
+            SubagentSpec {
+                name: "general-purpose".to_string(),
+                description: "General test agent".to_string(),
+                prompt: "Test prompt".to_string(),
+                tool_allowlist: None,
+                scope: "project".to_string(),
+                source_path: root_dir.join(".claude/agents/general-purpose.md"),
             },
-            &default_tools(),
-            &built_in_skills(),
-            &AgentState::new(),
-            "Answer directly.",
         );
 
-        assert!(matches!(
-            decision,
-            Decision::CallTool {
-                tool_name,
-                arguments,
-                ..
-            } if tool_name == "queue_ingress" && arguments == json!({})
-        ));
+        MainAgent {
+            root_dir,
+            home_dir: None,
+            config: AgentConfig {
+                system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+                default_model: "OpenAI GPT-5.4",
+                fallback_model: FALLBACK_MODEL,
+                planner_backend: "local heuristic planner".to_string(),
+                max_retries: MAX_RETRIES,
+            },
+            llm_engine: None,
+            fallback_engine: None,
+            tools: default_tools(),
+            mcp_servers: Vec::new(),
+            observability: Observability::from_env(),
+            memory_stack: MemoryStack::default(),
+            subagents,
+            commands: BTreeMap::new(),
+        }
     }
 
     #[test]
-    fn calls_tool_when_requested() {
-        let agent = MainAgent::new("system".to_string());
-        let result = agent.run("Use tool word_count for this sentence.");
+    fn split_frontmatter_extracts_fields_and_body() {
+        let (frontmatter, body) =
+            split_frontmatter("---\nname: plan\ndescription: Planner\n---\n\n# Body\nPrompt");
 
-        assert_eq!(result.status, RunStatus::Completed);
-        assert_eq!(result.output, "Word count tool output: 6");
+        assert_eq!(frontmatter.get("name"), Some(&"plan".to_string()));
+        assert_eq!(frontmatter.get("description"), Some(&"Planner".to_string()));
+        assert!(body.contains("# Body"));
     }
 
     #[test]
-    fn heuristic_explicit_tool_request_supports_json_arguments() {
-        let agent = MainAgent::new("system".to_string());
-        let result = agent.run("Use tool echo with {\"text\":\"from args\"}");
+    fn load_memory_stack_follows_imports() {
+        let root = temp_root("memory-stack");
+        let imported = root.join("docs.md");
+        fs::write(&imported, "# Extra\nImported memory").expect("imported file");
+        fs::write(
+            root.join("CLAUDE.md"),
+            format!("# Root\n@{}\n", imported.display()),
+        )
+        .expect("root memory");
 
-        assert_eq!(result.status, RunStatus::Completed);
-        assert_eq!(result.output, "Echo tool output: from args");
+        let stack = load_memory_stack(&root, None).expect("memory stack should load");
+
+        assert_eq!(stack.sources.len(), 2);
+        assert!(stack.merged_instructions.contains("Imported memory"));
     }
 
     #[test]
-    fn retries_once_then_recovers_for_retry_once_skill() {
-        let agent = MainAgent::new("system".to_string());
-        let result = agent.run("Use skill retry_once.");
+    fn project_subagent_overrides_user_subagent() {
+        let root = temp_root("subagent-project");
+        let home = temp_root("subagent-home");
+        let user_dir = home.join(".claude").join("agents");
+        let project_dir = root.join(".claude").join("agents");
+        fs::create_dir_all(&user_dir).expect("user dir");
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(
+            user_dir.join("plan.md"),
+            "---\nname: plan\ndescription: User planner\n---\nUser",
+        )
+        .expect("user agent");
+        fs::write(
+            project_dir.join("plan.md"),
+            "---\nname: plan\ndescription: Project planner\n---\nProject",
+        )
+        .expect("project agent");
 
-        assert_eq!(result.status, RunStatus::Completed);
-        assert_eq!(result.output, "Retry-once skill recovered successfully.");
+        let subagents = load_subagent_specs(&root, Some(&home)).expect("subagents should load");
+        let plan = subagents.get("plan").expect("plan agent should exist");
+
+        assert_eq!(plan.description, "Project planner");
+        assert_eq!(plan.scope, "project");
+    }
+
+    #[test]
+    fn expand_custom_command_replaces_arguments() {
+        let command = CustomCommand {
+            name: "review".to_string(),
+            description: "Run review".to_string(),
+            template: "Review $1 with $ARGUMENTS".to_string(),
+            source_path: PathBuf::from("review.md"),
+            scope: DefinitionScope::Project,
+        };
+
+        let expanded = expand_custom_command(&command, "src/main.rs thoroughly");
+
+        assert_eq!(expanded, "Review src/main.rs with src/main.rs thoroughly");
+    }
+
+    #[test]
+    fn render_usage_summary_lists_main_and_subagent_requests() {
+        let root = temp_root("usage-summary");
+        let agent = test_agent(root);
+
+        let result = agent.run("Inspect the task and suggest next steps");
+        let summary = result.render_usage_summary();
+
+        assert!(summary.contains("Token usage"));
+        assert!(summary.contains("main agent request: 0 input, 0 output, 0 total"));
+        assert!(summary.contains("subagent `general-purpose`: 0 input, 0 output, 0 total"));
         assert!(result
             .trace
             .iter()
-            .any(|line| line.contains("Retry attempt 1/3")));
-    }
-
-    #[test]
-    fn planner_skill_is_available_and_selected_by_name() {
-        let decision = decide_next_step_heuristic(
-            &AgentConfig {
-                system_prompt: "system".to_string(),
-                max_retries: MAX_RETRIES,
-                default_model: DEFAULT_MODEL,
-                fallback_model: FALLBACK_MODEL,
-                planner_model: None,
-            },
-            &default_tools(),
-            &built_in_skills(),
-            &AgentState::new(),
-            "Use skill planner to analyze the queue.",
-        );
-
-        assert!(matches!(
-            decision,
-            Decision::CallSkill(name, _) if name == "planner"
-        ));
-    }
-
-    #[test]
-    fn stops_after_three_retries() {
-        let agent = MainAgent::new("system".to_string());
-        let result = agent.run("retry please");
-
-        assert_eq!(result.status, RunStatus::Stopped);
+            .any(|entry| entry.contains("Token usage: main agent request")));
         assert!(result
             .trace
             .iter()
-            .any(|line| line.contains("Retry attempt 3/3")));
+            .any(|entry| entry.contains("Token usage: subagent `general-purpose`")));
     }
 
     #[test]
-    fn converts_valid_planner_payload_to_tool_decision() {
-        let payload = PlannerPayload {
-            action: "tool".to_string(),
-            tool_name: "echo".to_string(),
-            tool_arguments_json: "{}".to_string(),
-            skill_name: String::new(),
-            answer: String::new(),
-            reason: "tool needed".to_string(),
-        };
+    fn empty_input_reports_noop_usage() {
+        let root = temp_root("usage-empty");
+        let agent = test_agent(root);
 
-        let decision = planner_payload_to_decision(&payload, &default_tools(), &built_in_skills())
-            .expect("payload should convert");
-        assert!(matches!(
-            decision,
-            Decision::CallTool {
-                tool_name,
-                arguments,
-                ..
-            } if tool_name == "echo" && arguments == json!({})
-        ));
+        let result = agent.run("   ");
+        let summary = result.render_usage_summary();
+
+        assert!(result.stopped);
+        assert!(summary.contains("main agent request: 0 input, 0 output, 0 total"));
+        assert!(summary.contains("empty input; no model API call"));
     }
 
     #[test]
-    fn converts_valid_planner_payload_to_web_search_decision() {
-        let payload = PlannerPayload {
-            action: "tool".to_string(),
-            tool_name: "web_search".to_string(),
-            tool_arguments_json: "{\"query\":\"rust news\"}".to_string(),
-            skill_name: String::new(),
-            answer: String::new(),
-            reason: "research needed".to_string(),
-        };
+    fn infer_tool_request_routes_web_queries_to_web_search() {
+        let inferred =
+            infer_tool_request("Find the latest OpenAI API docs updates", &default_tools())
+                .expect("web search should be inferred");
 
-        let decision = planner_payload_to_decision(&payload, &default_tools(), &built_in_skills())
-            .expect("payload should convert");
-        assert!(matches!(
-            decision,
-            Decision::CallTool {
-                tool_name,
-                arguments,
-                ..
-            } if tool_name == "web_search" && arguments == json!({ "query": "rust news" })
-        ));
+        assert_eq!(inferred.0, "web_search");
+        assert_eq!(inferred.1, Value::Object(Default::default()));
+        assert!(inferred.2.contains("Planner inferred `web_search`"));
     }
 
     #[test]
-    fn planner_schema_uses_stringified_tool_arguments_for_strict_json_schema() {
-        let schema = planner_schema();
-        let tool_arguments = schema
-            .get("properties")
-            .and_then(|properties| properties.get("tool_arguments_json"))
-            .expect("planner schema should define tool_arguments_json");
+    fn web_queries_use_web_search_path_without_explicit_tool_wrapper() {
+        let root = temp_root("web-search-routing");
+        let agent = test_agent(root);
 
-        assert_eq!(tool_arguments.get("type"), Some(&json!("string")));
-        assert!(tool_arguments.get("additionalProperties").is_none());
-        assert!(tool_arguments.get("oneOf").is_none());
-    }
+        let result = agent.run("Search the web for the latest Rust release notes");
 
-    #[test]
-    fn reasoning_messages_are_extracted_from_trace() {
-        let trace = vec![
-            "Decision: call tool `word_count` (count words)".to_string(),
-            "Reasoning: Using tool `word_count` because count words".to_string(),
-        ];
-
-        assert_eq!(
-            collect_reasoning_messages(&trace),
-            vec!["Using tool `word_count` because count words".to_string()]
-        );
-    }
-
-    #[test]
-    fn extracts_output_text_from_openai_response() {
-        let response: OpenAiResponse = serde_json::from_value(json!({
-            "output": [
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "Hello from the model."
-                        }
-                    ]
-                }
-            ]
-        }))
-        .expect("response should parse");
-
-        assert_eq!(
-            response.output_text().as_deref(),
-            Some("Hello from the model.")
-        );
-    }
-
-    #[test]
-    fn parses_streamed_reasoning_summary_and_completed_response() {
-        let stream = concat!(
-            "event: response.reasoning_summary_text.delta\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"summary_index\":0,\"delta\":\"Thinking\"}\n",
-            "\n",
-            "event: response.reasoning_summary_text.delta\n",
-            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"summary_index\":0,\"delta\":\" aloud\"}\n",
-            "\n",
-            "event: response.reasoning_summary_text.done\n",
-            "data: {\"type\":\"response.reasoning_summary_text.done\",\"summary_index\":0,\"text\":\"Thinking aloud\"}\n",
-            "\n",
-            "event: response.completed\n",
-            "data: {\"type\":\"response.completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"action\\\":\\\"finish\\\",\\\"tool_name\\\":\\\"\\\",\\\"skill_name\\\":\\\"\\\",\\\"answer\\\":\\\"Hello\\\",\\\"reason\\\":\\\"direct\\\"}\"}]}]}\n",
-            "\n"
-        );
-
-        let parsed = parse_streaming_openai_response(Cursor::new(stream.as_bytes()), None)
-            .expect("stream should parse");
-
-        assert_eq!(parsed.reasoning, vec!["Thinking aloud".to_string()]);
-        assert_eq!(
-            parsed.response.output_text().as_deref(),
-            Some("{\"action\":\"finish\",\"tool_name\":\"\",\"skill_name\":\"\",\"answer\":\"Hello\",\"reason\":\"direct\"}")
-        );
-    }
-
-    #[test]
-    fn extracts_web_search_query_from_common_prefixes() {
-        assert_eq!(
-            extract_web_search_query("Use tool web_search to research the Rust 2024 roadmap."),
-            "research the Rust 2024 roadmap."
-        );
-        assert_eq!(
-            extract_web_search_query("Research: current TypeScript 6 roadmap"),
-            "current TypeScript 6 roadmap"
-        );
-    }
-
-    #[test]
-    fn formats_perplexity_response_with_citations_and_results() {
-        let response: PerplexityResponse = serde_json::from_value(json!({
-            "model": "sonar-pro",
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "Rust remains popular for systems programming and performance-sensitive services."
-                    }
-                }
-            ],
-            "citations": [
-                "https://example.com/rust-report",
-                "https://example.com/rust-benchmarks"
-            ],
-            "search_results": [
-                {
-                    "title": "Rust Report",
-                    "url": "https://example.com/rust-report",
-                    "snippet": "Survey data about Rust adoption.",
-                    "date": "2026-01-15"
-                }
-            ],
-            "related_questions": [
-                "How does Rust compare with Go for backend services?"
-            ]
-        }))
-        .expect("response should parse");
-
-        let formatted = format_perplexity_response("Rust adoption trends", &response);
-
-        assert!(formatted.contains("Perplexity web research"));
-        assert!(formatted.contains("Rust remains popular"));
-        assert!(formatted.contains("Citations:"));
-        assert!(formatted.contains("Related follow-up questions:"));
-    }
-
-    #[test]
-    fn loads_installed_skills_from_repo_style_directory() {
-        let temp_dir = unique_test_directory("skills-loader");
-        let skills_root = temp_dir.join("skills");
-        let skill_dir = skills_root.join("release-notes");
-        fs::create_dir_all(&skill_dir).expect("skill directory should be created");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: release-notes\ndescription: Use when the user wants release notes.\n---\n\n# Release Notes\n\nWrite release notes.",
-        )
-        .expect("skill file should be written");
-
-        let (skills, warnings) = load_skill_catalog_from_dir(&skills_root);
-
-        let installed = skills
+        assert!(result.stopped);
+        assert!(result
+            .trace
             .iter()
-            .find(|skill| skill.is_named("release-notes"))
-            .expect("installed skill should be discovered");
-        assert_eq!(
-            installed.description(),
-            "Use when the user wants release notes."
-        );
-        assert!(warnings.is_empty());
-
-        fs::remove_dir_all(&temp_dir).expect("temp directory should be removed");
-    }
-
-    #[test]
-    fn heuristic_can_select_installed_skill_by_name() {
-        let temp_dir = unique_test_directory("skills-heuristic");
-        let skills_root = temp_dir.join("skills");
-        let skill_dir = skills_root.join("incident-report");
-        fs::create_dir_all(&skill_dir).expect("skill directory should be created");
-        fs::write(
-            skill_dir.join(SKILL_FILE_NAME),
-            "---\nname: incident-report\ndescription: Use when the user wants an incident report.\n---\n\n# Incident Report\n",
-        )
-        .expect("skill file should be written");
-
-        let (skills, warnings) = load_skill_catalog_from_dir(&skills_root);
-        assert!(warnings.is_empty());
-
-        let decision = decide_next_step_heuristic(
-            &AgentConfig {
-                system_prompt: "system".to_string(),
-                max_retries: MAX_RETRIES,
-                default_model: DEFAULT_MODEL,
-                fallback_model: FALLBACK_MODEL,
-                planner_model: None,
-            },
-            &default_tools(),
-            &skills,
-            &AgentState::new(),
-            "Use skill incident-report for this postmortem.",
-        );
-
-        assert!(matches!(
-            decision,
-            Decision::CallSkill(name, _) if name == "incident-report"
-        ));
-
-        fs::remove_dir_all(&temp_dir).expect("temp directory should be removed");
-    }
-
-    #[test]
-    fn loads_workspace_markdown_documents_from_uppercase_extension() {
-        let temp_dir = unique_test_directory("workspace-markdown");
-        let workspace_dir = temp_dir.join("Workspace");
-        fs::create_dir_all(&workspace_dir).expect("workspace directory should be created");
-        fs::write(
-            workspace_dir.join("Agent.MD"),
-            "# AGENT\n\n- goal: plan the latest queue item\n",
-        )
-        .expect("workspace markdown should be written");
-
-        let documents = load_markdown_documents(&workspace_dir)
-            .expect("workspace markdown documents should load");
-
-        assert!(documents.iter().any(|(path, contents)| {
-            path.file_name().and_then(|name| name.to_str()) == Some("Agent.MD")
-                && contents.contains("plan the latest queue item")
-        }));
-
-        fs::remove_dir_all(&temp_dir).expect("temp directory should be removed");
-    }
-
-    #[test]
-    fn queue_runner_continues_polling_after_non_interactive_stdin_closes() {
-        assert!(should_continue_polling_after_stdin_close(false));
-    }
-
-    #[test]
-    fn queue_runner_stops_after_interactive_stdin_closes() {
-        assert!(!should_continue_polling_after_stdin_close(true));
-    }
-
-    fn unique_test_directory(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should move forward")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "agent-in-rust-{prefix}-{}-{}",
-            std::process::id(),
-            nanos
-        ))
+            .any(|entry| entry.contains("Planner inferred `web_search`")));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("Retry limit reached")));
     }
 }

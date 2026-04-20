@@ -4,13 +4,12 @@ This scaffold can export runtime traces to both LangSmith and Langfuse through O
 
 ## What Is Traced
 
-- `main_agent.run` root spans for normal agent runs
-- `planner.decide_next_step` spans for planner decisions
+- `main_agent.run` root spans for normal session runs
+- loop-iteration metadata for task contracts, planner decisions, observations, retries, and stop reasons
+- `subagent.*` spans for Claude-style delegated subagent execution
 - `tool.*` spans for tool execution
-- `skill.*` spans for skill execution
-- `openai.plan` and `openai.skill.*` spans for OpenAI-backed planner or installed skill calls
 - runtime log lines as span events when a traced span is active
-- retry, stop, and final-output metadata on the active span
+- final-output metadata on the active span
 
 ## LangSmith Setup
 
@@ -59,3 +58,4 @@ If both LangSmith and Langfuse are configured, the agent exports the same trace 
 - No exporter is created unless at least one backend is configured correctly.
 - Misconfigured observability only emits warnings into the local agent trace; it does not stop the agent loop.
 - The current implementation uses simple OTLP exporters to keep the scaffold small and synchronous.
+- The harness-first rewrite keeps MCP and web-search tools visible in the same trace tree as delegated subagents.
