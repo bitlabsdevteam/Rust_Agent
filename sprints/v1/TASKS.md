@@ -3,9 +3,10 @@
   - Files: `sprints/v1/PRD.md`, `sprints/v1/TASKS.md`
   - Completed: 2026-04-20 — Verified the sprint artifacts exist and include the required PRD structure and ordered backlog.
 
-- [ ] Task 2: Add repo-local architecture docs for the current CLI harness (P0)
+- [x] Task 2: Add repo-local architecture docs for the current CLI harness (P0)
   - Acceptance: A focused doc explains runtime loop, planner flow, memory surfaces, and extension points without requiring a full source dive.
   - Files: `docs/architecture.md` or equivalent repo-local markdown, `AGENTS.md` if a pointer is needed
+  - Completed: 2026-04-20 — Added `docs/architecture.md` and linked it from `AGENTS.md` as the repo-local architecture reference.
 
 - [ ] Task 3: Add repo-local operator docs for CLI usage and memory behavior (P0)
   - Acceptance: A doc explains session/run/list/init usage, slash commands, compaction, and Mem0-vs-file long-term memory behavior.

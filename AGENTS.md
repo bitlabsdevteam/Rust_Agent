@@ -26,6 +26,10 @@ Humans steer. Agents execute.
 - prefer progressive disclosure over one giant instruction blob
 - if the project grows, move detailed architecture, product, reliability, and security guidance into `docs/` and keep this file as the map to those sources
 
+Current repo-local reference docs:
+
+- `docs/architecture.md` - current CLI harness architecture, runtime loop, planner flow, memory surfaces, and extension points
+
 ## External AI Agent Reference
 
 For any task involving building, designing, reviewing, or extending AI agents, consult this vault before proposing architecture or making implementation decisions:
