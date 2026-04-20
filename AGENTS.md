@@ -29,6 +29,7 @@ Humans steer. Agents execute.
 Current repo-local reference docs:
 
 - `docs/architecture.md` - current CLI harness architecture, runtime loop, planner flow, memory surfaces, and extension points
+- `docs/cli.md` - operator guide for top-level commands, slash commands, memory behavior, and compaction
 
 ## External AI Agent Reference
 

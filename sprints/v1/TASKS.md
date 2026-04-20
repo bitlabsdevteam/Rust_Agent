@@ -8,9 +8,10 @@
   - Files: `docs/architecture.md` or equivalent repo-local markdown, `AGENTS.md` if a pointer is needed
   - Completed: 2026-04-20 — Added `docs/architecture.md` and linked it from `AGENTS.md` as the repo-local architecture reference.
 
-- [ ] Task 3: Add repo-local operator docs for CLI usage and memory behavior (P0)
+- [x] Task 3: Add repo-local operator docs for CLI usage and memory behavior (P0)
   - Acceptance: A doc explains session/run/list/init usage, slash commands, compaction, and Mem0-vs-file long-term memory behavior.
   - Files: `docs/cli.md` or equivalent repo-local markdown
+  - Completed: 2026-04-20 — Added `docs/cli.md` covering top-level commands, session commands, compaction, and active memory backends, and linked it from `AGENTS.md`.
 
 - [ ] Task 4: Introduce a minimal eval fixture format for planner decisions (P0)
   - Acceptance: The repo contains a simple fixture schema that can express user input, observations, and expected planner action.
