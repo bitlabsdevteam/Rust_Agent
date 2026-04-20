@@ -87,7 +87,7 @@ fn validate_fixture(fixture: &PlannerEvalFixture) -> io::Result<()> {
             "Eval fixture `name` must not be empty.",
         ));
     }
-    if fixture.user_input.trim().is_empty() {
+    if fixture.user_input.trim().is_empty() && fixture.expected.action != "stop" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Eval fixture `user_input` must not be empty.",
@@ -269,6 +269,23 @@ mod tests {
         .expect_err("fixture should fail validation");
 
         assert!(error.to_string().contains("tool_name"));
+    }
+
+    #[test]
+    fn parse_eval_fixture_allows_empty_user_input_for_stop_action() {
+        let fixture = parse_eval_fixture(
+            r#"{
+                "name": "empty input stops",
+                "user_input": "",
+                "expected": {
+                    "action": "stop"
+                }
+            }"#,
+        )
+        .expect("stop fixture should allow empty input");
+
+        assert_eq!(fixture.user_input, "");
+        assert_eq!(fixture.expected.action, "stop");
     }
 
     #[test]

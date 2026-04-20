@@ -1,0 +1,8 @@
+{
+  "name": "stop immediately on empty input",
+  "user_input": "",
+  "observations": [],
+  "expected": {
+    "action": "stop"
+  }
+}

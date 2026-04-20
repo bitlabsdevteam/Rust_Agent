@@ -758,6 +758,37 @@ impl MainAgent {
         input: &str,
         observations: &[String],
     ) -> PlannerEvalActualDecision {
+        if input.trim().is_empty() {
+            return PlannerEvalActualDecision {
+                action: "stop".to_string(),
+                tool_name: None,
+                skill_name: None,
+                subagent_name: None,
+                reason: "user input was empty".to_string(),
+            };
+        }
+        if let Some(observation) = observations.last() {
+            if observation.starts_with("Recoverable ")
+                || observation.starts_with("Planner retry request:")
+            {
+                return PlannerEvalActualDecision {
+                    action: "retry".to_string(),
+                    tool_name: None,
+                    skill_name: None,
+                    subagent_name: None,
+                    reason: "the latest observation still reflects a recoverable failure"
+                        .to_string(),
+                };
+            }
+
+            return PlannerEvalActualDecision {
+                action: "finish".to_string(),
+                tool_name: None,
+                skill_name: None,
+                subagent_name: None,
+                reason: "the latest observation is now the best available answer".to_string(),
+            };
+        }
         let state = SessionState::default();
         let task_contract = self.build_task_contract(input, observations);
         let run = self.decide_next_step(&state, input, &task_contract, observations, 0);
@@ -4557,6 +4588,34 @@ mod tests {
         assert_eq!(
             decision.reason,
             "the latest observation is now the best available answer"
+        );
+    }
+
+    #[test]
+    fn planner_eval_preview_stops_on_empty_input() {
+        let root = temp_root("planner-eval-stop");
+        let agent = test_agent(root);
+
+        let decision = agent.preview_planner_decision("   ", &[]);
+
+        assert_eq!(decision.action, "stop");
+        assert_eq!(decision.reason, "user input was empty");
+    }
+
+    #[test]
+    fn planner_eval_preview_retries_after_recoverable_observation() {
+        let root = temp_root("planner-eval-retry");
+        let agent = test_agent(root);
+
+        let decision = agent.preview_planner_decision(
+            "retry the search",
+            &["Recoverable tool failure from `web_search`: timeout".to_string()],
+        );
+
+        assert_eq!(decision.action, "retry");
+        assert_eq!(
+            decision.reason,
+            "the latest observation still reflects a recoverable failure"
         );
     }
 

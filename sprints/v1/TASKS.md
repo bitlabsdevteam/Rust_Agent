@@ -23,9 +23,10 @@
   - Files: `src/main.rs`, `src/mainAgent.rs`, optional new eval module
   - Completed: 2026-04-20 — Added `agent_in_rust eval`, a shared planner-preview eval path, and repo-local `ship-small` skill scaffolding so the seeded fixtures pass end-to-end.
 
-- [ ] Task 6: Add initial regression fixtures for core harness behavior (P0)
+- [x] Task 6: Add initial regression fixtures for core harness behavior (P0)
   - Acceptance: Fixtures cover tool selection, skill selection, subagent delegation, retry behavior, empty-input stop, and finish-on-observation.
   - Files: `evals/fixtures/*`
+  - Completed: 2026-04-20 — Added regression fixtures for finish, retry, and empty-input stop, and tightened eval preview handling so harness-owned stop/retry outcomes stay deterministic.
 
 - [ ] Task 7: Make planner and trace outputs easier to inspect in eval results (P1)
   - Acceptance: Eval failures show enough structured detail to understand expected vs actual action and the key reasoning context.

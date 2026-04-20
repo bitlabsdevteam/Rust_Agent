@@ -1,0 +1,10 @@
+{
+  "name": "finish returns the latest successful observation",
+  "user_input": "summarize the current task state",
+  "observations": [
+    "The latest observation already contains the answer."
+  ],
+  "expected": {
+    "action": "finish"
+  }
+}
