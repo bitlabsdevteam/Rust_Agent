@@ -1,7 +1,7 @@
 ---
 name: explore
 description: Inspect code paths, locate files, and return a compact handoff.
-tools: [web_search]
+tools: [web_search_tool]
 ---
 
 # Explore Agent

@@ -27,11 +27,15 @@ agent_in_rust chat
 
 Use this mode when you want a persistent local session with slash commands, short-term memory, and trace visibility.
 
+By default, the runtime assembles the system prompt from the files in `system_prompt/`. `--system` overrides that folder for a single invocation.
+
+Internally, CLI input now enters the same control-plane seam used by future channels: CLI adapter, in-process bus, router, worker runtime, and outbound delivery contracts. The user-facing command remains the same.
+
 ### Run a one-shot prompt
 
 ```bash
 agent_in_rust run --input "Plan the refactor"
-agent_in_rust run --input "Use tool web_search with {\"query\":\"latest Rust 2026 edition updates\"}" --trace
+agent_in_rust run --input "Use tool web_search_tool with {\"query\":\"latest Rust 2026 edition updates\"}" --trace
 ```
 
 Use this when you want a single request without entering the interactive REPL.
@@ -66,6 +70,9 @@ This loads `Workspace/short-term.json`, summarizes older turns into the compacte
 ```bash
 agent_in_rust skills
 agent_in_rust skills list
+agent_in_rust skills show --name ship-small
+agent_in_rust skills validate
+agent_in_rust skills validate --name ship-small
 agent_in_rust skills create --name ship-small --description "Bias toward the smallest coherent change set"
 agent_in_rust skills install --source owner/repo/skill-name
 agent_in_rust skills install --source /absolute/path/to/skill --scope user
@@ -76,6 +83,13 @@ Skill sources are loaded from:
 - project: `.claude/skills/<name>/SKILL.md`
 - user: `~/.claude/skills/<name>/SKILL.md`
 
+Behavior notes:
+
+- `skills show` renders the loaded metadata contract plus the full instruction body for one skill.
+- `skills validate` reports invalid or skipped skill files and confirms which skills loaded successfully.
+- user-scoped skills load first, but project-scoped skills override them on name collision.
+- invalid skill files are skipped instead of crashing the whole harness.
+
 ### Scaffold missing project files
 
 ```bash
@@ -85,6 +99,7 @@ agent_in_rust init
 This creates missing starter artifacts such as:
 
 - `CLAUDE.md`
+- `system_prompt/system_prompt.md`
 - `.claude/agents/*.md`
 - `.claude/skills/ship-small/SKILL.md`
 - `.claude/commands/review.md`

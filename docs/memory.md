@@ -14,6 +14,12 @@ The harness exposes three distinct memory surfaces:
 - short-term session state loaded from `Workspace/short-term.json`
 - long-term memory loaded from Mem0 or `Workspace/MEMORY.md`
 
+Long-term memory now crosses a dedicated memory-agent boundary in `src/memory_agent.rs`.
+
+- `FileMemoryAgent` backs the local file path in `Workspace/MEMORY.md`
+- the runtime wraps Mem0 behind the same interface before loading or appending durable notes
+- a stub memory-agent implementation exists so future worker-based memory routing can be exercised without depending on Mem0 or the file backend
+
 Short-term memory is execution state, not standing instructions. The precedence rules below apply to the standing memory stack loaded into the planner.
 
 ## Standing Memory Precedence
@@ -70,6 +76,18 @@ This hook exists so future changes can:
 - pass relevant task files into memory loading
 - score or filter imported memory by path affinity
 - expose path-scoped loading in evals before enabling it broadly in the runtime
+
+## Memory-Agent Boundary
+
+Long-term memory reads and writes no longer reach directly into Mem0 or `Workspace/MEMORY.md` from the main runtime loop.
+
+Current behavior:
+
+- planner memory loading calls the memory-agent interface to fetch the long-term memory snapshot
+- `/remember <note>` calls the same interface to append durable notes
+- the current runtime still chooses the backend locally: Mem0 when configured, file storage otherwise
+
+This is intentionally a narrow seam. The current implementation is still local-process and deterministic, but later work can replace the local backend choice with a dedicated memory worker or service without changing the rest of the runtime contract.
 
 ## Non-Goals For V1
 

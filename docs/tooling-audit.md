@@ -6,10 +6,10 @@ This note records the current `npm audit` findings observed while working in thi
 
 ## Current State
 
-Running `npm audit` from this repository reports 12 vulnerabilities:
+Running `npm audit` from this repository reports 13 vulnerabilities:
 
 - 5 high
-- 7 moderate
+- 8 moderate
 
 The affected transitive packages include:
 

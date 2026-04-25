@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use opentelemetry::trace::{self, Span, Status, Tracer, TracerProvider};
+use opentelemetry::trace::{self, Span, Tracer, TracerProvider};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
@@ -103,30 +103,6 @@ impl Observability {
                 KeyValue::new("log.message", compact_text(message, 2_000)),
             ],
         );
-    }
-
-    pub fn set_attributes(attributes: Vec<KeyValue>) {
-        trace::get_active_span(|span| span.set_attributes(attributes));
-    }
-
-    pub fn set_status_ok() {
-        trace::get_active_span(|span| span.set_status(Status::Ok));
-    }
-
-    pub fn set_status_error(message: impl Into<String>) {
-        let message = message.into();
-        trace::get_active_span(|span| span.set_status(Status::error(message.clone())));
-    }
-
-    pub fn active_trace_id() -> Option<String> {
-        let mut trace_id = None;
-        trace::get_active_span(|span| {
-            let context = span.span_context();
-            if context.is_valid() {
-                trace_id = Some(context.trace_id().to_string());
-            }
-        });
-        trace_id
     }
 }
 
@@ -323,13 +299,6 @@ pub fn compact_text(text: &str, max_chars: usize) -> String {
         let compact = trimmed.chars().take(max_chars).collect::<String>();
         format!("{compact}...")
     }
-}
-
-pub fn kv_json(key: impl Into<String>, value: &impl serde::Serialize) -> KeyValue {
-    let key = key.into();
-    let serialized =
-        serde_json::to_string(value).unwrap_or_else(|_| "\"<unserializable>\"".to_string());
-    KeyValue::new(key, compact_text(&serialized, 4_000))
 }
 
 #[cfg(test)]

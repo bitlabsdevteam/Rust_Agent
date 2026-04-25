@@ -1,21 +1,38 @@
 #[allow(non_snake_case)]
 mod Tools;
 
-mod mcp;
-mod observability;
-mod runtime_log;
+mod bus;
+mod channels;
+mod concurrency;
+mod dispatch;
 mod evals;
+mod mcp;
+mod memory_agent;
+mod observability;
+mod prompt_layers;
+mod router;
+mod runtime_log;
+mod scheduler;
+mod worker;
 
 #[allow(non_snake_case)]
 mod mainAgent;
 
+use crate::bus::{Bus, InProcessBus};
+use crate::channels::cli::{CliChannel, CliInvocation};
+use crate::channels::ChannelAdapter;
 use crate::mainAgent::{
     MainAgent, SkillCreateRequest, SkillInstallRequest, WaitModeConfig, DEFAULT_SYSTEM_PROMPT,
 };
+use crate::router::{DefaultRouter, RouteTarget, Router};
+use crate::worker::{MainAgentWorker, WorkerRequest, WorkerRuntime};
 use std::env;
 use std::fmt;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const SYSTEM_PROMPT_DIR: &str = "system_prompt";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -33,6 +50,8 @@ enum SkillsCommand {
     List,
     Create(SkillCreateOptions),
     Install(SkillInstallOptions),
+    Show(SkillShowOptions),
+    Validate(SkillValidateOptions),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +66,16 @@ struct SkillInstallOptions {
     source: String,
     skill_name: Option<String>,
     scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillShowOptions {
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillValidateOptions {
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +320,12 @@ fn parse_skills_command(args: &[String]) -> Result<SkillsCommand, CliError> {
         [subcommand, rest @ ..] if subcommand == "install" => {
             Ok(SkillsCommand::Install(parse_skill_install_options(rest)?))
         }
+        [subcommand, rest @ ..] if subcommand == "show" => {
+            Ok(SkillsCommand::Show(parse_skill_show_options(rest)?))
+        }
+        [subcommand, rest @ ..] if subcommand == "validate" => {
+            Ok(SkillsCommand::Validate(parse_skill_validate_options(rest)?))
+        }
         [other, ..] => Err(CliError::new(format!(
             "Unknown `skills` subcommand: {other}"
         ))),
@@ -382,25 +417,71 @@ fn parse_skill_install_options(args: &[String]) -> Result<SkillInstallOptions, C
     })
 }
 
+fn parse_skill_show_options(args: &[String]) -> Result<SkillShowOptions, CliError> {
+    let mut name = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::new("Missing value for `--name`."))?;
+                name = Some(value.clone());
+                index += 2;
+            }
+            unexpected => {
+                return Err(CliError::new(format!("Unknown argument: {unexpected}")));
+            }
+        }
+    }
+
+    Ok(SkillShowOptions {
+        name: name.ok_or_else(|| CliError::new("`skills show` requires `--name`."))?,
+    })
+}
+
+fn parse_skill_validate_options(args: &[String]) -> Result<SkillValidateOptions, CliError> {
+    let mut name = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--name" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::new("Missing value for `--name`."))?;
+                name = Some(value.clone());
+                index += 2;
+            }
+            unexpected => {
+                return Err(CliError::new(format!("Unknown argument: {unexpected}")));
+            }
+        }
+    }
+
+    Ok(SkillValidateOptions { name })
+}
+
 fn help_text(bin_name: &str, topic: &HelpTopic) -> String {
     match topic {
         HelpTopic::General => format!(
-            "{bin_name} runs a Claude-style local coding session.\n\nDefault entrypoint:\n  {bin_name}                Start chatting\n  {bin_name} --trace        Start chatting and print the execution trace\n\nOther commands:\n  {bin_name} session [--system <prompt>] [--trace]\n  {bin_name} run --input <prompt> [--system <prompt>] [--trace]\n  {bin_name} list\n  {bin_name} compact\n  {bin_name} eval [--fixtures <dir>]\n  {bin_name} skills [list|create|install] ...\n  {bin_name} init\n  {bin_name} help [session|run|list|skills|init|compact|eval]\n  {bin_name} help eval\n\nNotes:\n  - Running `{bin_name}` with no command starts the interactive chat session.\n  - Project memory loads from `CLAUDE.md` and imported `@path` files.\n  - Short-term memory resumes from `Workspace/short-term.json` when present.\n  - Long-term memory uses Mem0 when `MEM0_API_KEY` is configured and falls back to `Workspace/MEMORY.md` otherwise.\n  - Project subagents load from `.claude/agents/*.md`.\n  - Skills load from `.claude/skills/<name>/SKILL.md` and `~/.claude/skills/<name>/SKILL.md`.\n  - Project slash commands load from `.claude/commands/*.md`.\n  - MCP tools remain available when `MCP_SERVERS` is configured.\n"
+            "{bin_name} runs a Claude-style local coding session.\n\nDefault entrypoint:\n  {bin_name}                Start chatting\n  {bin_name} --trace        Start chatting and print the execution trace\n\nOther commands:\n  {bin_name} session [--system <prompt>] [--trace]\n  {bin_name} run --input <prompt> [--system <prompt>] [--trace]\n  {bin_name} list\n  {bin_name} compact\n  {bin_name} eval [--fixtures <dir>]\n  {bin_name} skills [list|show|validate|create|install] ...\n  {bin_name} init\n  {bin_name} help [session|run|list|skills|init|compact|eval]\n  {bin_name} help eval\n\nNotes:\n  - Running `{bin_name}` with no command starts the interactive chat session.\n  - The default system prompt loads from files in `system_prompt/` unless `--system` or `AGENT_SYSTEM_PROMPT` overrides it.\n  - Project memory loads from `CLAUDE.md` and imported `@path` files.\n  - Short-term memory resumes from `Workspace/short-term.json` when present.\n  - Final LLM request context snapshots are printed before planner calls and appended to `history/context_history.json`.\n  - Long-term memory uses Mem0 when `MEM0_API_KEY` is configured and falls back to `Workspace/MEMORY.md` otherwise.\n  - Project subagents load from `.claude/agents/*.md`.\n  - Skills load from `.claude/skills/<name>/SKILL.md` and `~/.claude/skills/<name>/SKILL.md`.\n  - Project slash commands load from `.claude/commands/*.md`.\n  - MCP tools remain available when `MCP_SERVERS` is configured.\n"
         ),
         HelpTopic::Session => format!(
-            "Start an interactive Claude-style session.\n\nUsage:\n  {bin_name}\n  {bin_name} --trace\n  {bin_name} session\n  {bin_name} session --system <prompt> --trace\n  {bin_name} chat\n\nIn-session commands:\n  /help\n  /agents\n  /skills\n  /memory\n  /remember <note>\n  /model\n  /clear\n  /compact\n  /mcp\n  /review [task]\n  /skill <name> [task]\n  /init\n  /agent <name> <task>\n  /trace\n  /exit\n"
+            "Start an interactive Claude-style session.\n\nUsage:\n  {bin_name}\n  {bin_name} --trace\n  {bin_name} session\n  {bin_name} session --system <prompt> --trace\n  {bin_name} chat\n\nThe default system prompt is assembled from `system_prompt/` when no override is provided.\n\nIn-session commands:\n  /help\n  /agents\n  /skills\n  /memory\n  /remember <note>\n  /model\n  /clear\n  /compact\n  /mcp\n  /review [task]\n  /skill <name> [task]\n  /init\n  /agent <name> <task>\n  /trace\n  /exit\n"
         ),
         HelpTopic::Run => format!(
-            "Run a one-shot prompt through the Claude-style runtime.\n\nUsage:\n  {bin_name} run --input \"Plan the refactor\"\n  {bin_name} run --input \"Use tool web_search with {{\\\"query\\\":\\\"latest Rust 2026 edition updates\\\"}}\" --trace\n"
+            "Run a one-shot prompt through the Claude-style runtime.\n\nUsage:\n  {bin_name} run --input \"Plan the refactor\"\n  {bin_name} run --input \"Use tool web_search_tool with {{\\\"query\\\":\\\"latest Rust 2026 edition updates\\\"}}\" --trace\n"
         ),
         HelpTopic::List => format!(
             "Show the currently loaded Claude-style project surface.\n\nUsage:\n  {bin_name} list\n"
         ),
         HelpTopic::Skills => format!(
-            "Manage reusable skills.\n\nUsage:\n  {bin_name} skills\n  {bin_name} skills list\n  {bin_name} skills create --name <name> --description <text> [--scope project|user]\n  {bin_name} skills install --source <path|owner/repo|owner/repo/skill|github-url|skills.sh-url> [--skill <name>] [--scope project|user]\n"
+            "Manage reusable skills.\n\nUsage:\n  {bin_name} skills\n  {bin_name} skills list\n  {bin_name} skills show --name <name>\n  {bin_name} skills validate [--name <name>]\n  {bin_name} skills create --name <name> --description <text> [--scope project|user]\n  {bin_name} skills install --source <path|owner/repo|owner/repo/skill|github-url|skills.sh-url> [--skill <name>] [--scope project|user]\n"
         ),
         HelpTopic::Init => format!(
-            "Scaffold Claude-style project files.\n\nUsage:\n  {bin_name} init\n\nThis creates `CLAUDE.md`, `.claude/agents/*.md`, `.claude/skills/ship-small/SKILL.md`, `.claude/commands/review.md`, and the fallback file `Workspace/MEMORY.md` when missing.\n"
+            "Scaffold Claude-style project files.\n\nUsage:\n  {bin_name} init\n\nThis creates `CLAUDE.md`, `system_prompt/system_prompt.md`, `.claude/agents/*.md`, `.claude/skills/ship-small/SKILL.md`, `.claude/commands/review.md`, and the fallback file `Workspace/MEMORY.md` when missing.\n"
         ),
         HelpTopic::Compact => format!(
             "Compact stored short-term context.\n\nUsage:\n  {bin_name} compact\n\nThis loads `Workspace/short-term.json`, summarizes older session turns into the compacted summary, retains the most recent turns, and writes the compacted snapshot back to disk.\n"
@@ -411,11 +492,78 @@ fn help_text(bin_name: &str, topic: &HelpTopic) -> String {
     }
 }
 
-fn resolve_system_prompt(explicit: Option<String>) -> String {
-    explicit
-        .or_else(|| env::var("AGENT_SYSTEM_PROMPT").ok())
+fn load_system_prompt_from_dir(system_prompt_dir: &Path) -> io::Result<String> {
+    let mut files = fs::read_dir(system_prompt_dir)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_file())
+                .unwrap_or(false)
+                && !entry.file_name().to_string_lossy().starts_with('.')
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|entry| entry.file_name());
+
+    if files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "No system prompt files found in `{}`.",
+                system_prompt_dir.display()
+            ),
+        ));
+    }
+
+    let sections = files
+        .into_iter()
+        .map(|entry| fs::read_to_string(entry.path()).map(|contents| contents.trim().to_string()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|contents| !contents.is_empty())
+        .collect::<Vec<_>>();
+
+    if sections.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "System prompt files in `{}` were empty.",
+                system_prompt_dir.display()
+            ),
+        ));
+    }
+
+    Ok(sections.join("\n\n"))
+}
+
+fn resolve_system_prompt_from_sources(
+    explicit: Option<String>,
+    env_override: Option<String>,
+    system_prompt_dir: &Path,
+) -> io::Result<String> {
+    if let Some(prompt) = explicit
+        .or(env_override)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string())
+    {
+        return Ok(prompt);
+    }
+
+    match load_system_prompt_from_dir(system_prompt_dir) {
+        Ok(prompt) => Ok(prompt),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(DEFAULT_SYSTEM_PROMPT.to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_system_prompt(explicit: Option<String>) -> io::Result<String> {
+    resolve_system_prompt_from_sources(
+        explicit,
+        env::var("AGENT_SYSTEM_PROMPT").ok(),
+        Path::new(SYSTEM_PROMPT_DIR),
+    )
 }
 
 fn print_catalog(agent: &MainAgent) {
@@ -465,8 +613,19 @@ fn print_catalog(agent: &MainAgent) {
 
     println!("\nSkills:");
     for skill in agent.skills() {
-        println!("- {} [{}]: {}", skill.name, skill.scope, skill.description);
+        println!(
+            "- {} [{}]: {} (allowed_tools: {})",
+            skill.name,
+            skill.scope,
+            skill.description,
+            skill
+                .allowed_tools
+                .as_ref()
+                .map(|items| items.join(", "))
+                .unwrap_or_else(|| "inherit all visible tools".to_string())
+        );
     }
+    println!("{}", agent.validate_skills(None));
 
     println!("\nCommands:");
     for command in agent.command_summaries() {
@@ -513,30 +672,50 @@ fn log_observability_status(agent: &MainAgent) {
 }
 
 fn run_session(agent: &mut MainAgent, options: SessionOptions) -> io::Result<()> {
-    if options.one_shot {
-        let input = options
-            .user_input
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "`run` requires `--input`.")
-            })?;
-        let result = agent.run(&input);
-        println!("{}", result.output);
-        println!("\n{}", result.render_usage_summary());
-        if options.show_trace {
-            println!("\nTrace:");
-            for entry in &result.trace {
-                println!("- {entry}");
+    let channel = CliChannel::new(CliInvocation::new(
+        options.user_input.clone(),
+        options.show_trace,
+        options.one_shot,
+    ));
+    let mut bus = InProcessBus::default();
+    let event = channel
+        .into_inbound_event()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "`run` requires `--input`."))?;
+    bus.publish_inbound(event)?;
+    let request_event = bus.forward_inbound().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "CLI channel did not enqueue an inbound event.",
+        )
+    })?;
+    let route = DefaultRouter::new().route(&request_event)?;
+
+    match route.target {
+        RouteTarget::MainWorker => {
+            if options.one_shot {
+                let result =
+                    MainAgentWorker::new(agent).execute(WorkerRequest::new(request_event))?;
+                println!("{}", result.output);
+                println!("\n{}", result.usage_summary);
+                if options.show_trace {
+                    println!("\nTrace:");
+                    for entry in &result.trace {
+                        println!("- {entry}");
+                    }
+                }
+                return Ok(());
             }
+
+            let request = WorkerRequest::new(request_event).with_wait_mode(WaitModeConfig {
+                prompt_label: "claude".to_string(),
+                show_trace: options.show_trace,
+                bin_name: "agent_in_rust".to_string(),
+            });
+            MainAgentWorker::new(agent).execute(request)?;
         }
-        return Ok(());
     }
 
-    agent.wait_for_context(WaitModeConfig {
-        prompt_label: "claude".to_string(),
-        show_trace: options.show_trace,
-        bin_name: "agent_in_rust".to_string(),
-    })
+    Ok(())
 }
 
 fn build_eval_suite(
@@ -594,20 +773,20 @@ fn main() -> io::Result<()> {
 
     match parse_command(&args) {
         Ok(Command::Session(options)) => {
-            let system_prompt = resolve_system_prompt(options.system_prompt.clone());
+            let system_prompt = resolve_system_prompt(options.system_prompt.clone())?;
             let mut agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             run_session(&mut agent, options)
         }
         Ok(Command::List) => {
-            let system_prompt = resolve_system_prompt(None);
+            let system_prompt = resolve_system_prompt(None)?;
             let agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             print_catalog(&agent);
             Ok(())
         }
         Ok(Command::Init) => {
-            let system_prompt = resolve_system_prompt(None);
+            let system_prompt = resolve_system_prompt(None)?;
             let mut agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             let created = agent.init_project_files()?;
@@ -622,7 +801,7 @@ fn main() -> io::Result<()> {
             Ok(())
         }
         Ok(Command::Compact) => {
-            let system_prompt = resolve_system_prompt(None);
+            let system_prompt = resolve_system_prompt(None)?;
             let mut agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             let result = agent.compact_context()?;
@@ -630,13 +809,13 @@ fn main() -> io::Result<()> {
             Ok(())
         }
         Ok(Command::Eval(options)) => {
-            let system_prompt = resolve_system_prompt(None);
+            let system_prompt = resolve_system_prompt(None)?;
             let agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             run_evals(&agent, options)
         }
         Ok(Command::Skills(command)) => {
-            let system_prompt = resolve_system_prompt(None);
+            let system_prompt = resolve_system_prompt(None)?;
             let mut agent = MainAgent::from_env(system_prompt)?;
             log_observability_status(&agent);
             match command {
@@ -650,6 +829,7 @@ fn main() -> io::Result<()> {
                             skill.source_path.display()
                         );
                     }
+                    println!("{}", agent.validate_skills(None));
                     Ok(())
                 }
                 SkillsCommand::Create(options) => {
@@ -668,6 +848,14 @@ fn main() -> io::Result<()> {
                         scope: options.scope,
                     })?;
                     println!("Installed skill: {}", path.display());
+                    Ok(())
+                }
+                SkillsCommand::Show(options) => {
+                    println!("{}", agent.show_skill(&options.name)?);
+                    Ok(())
+                }
+                SkillsCommand::Validate(options) => {
+                    println!("{}", agent.validate_skills(options.name.as_deref()));
                     Ok(())
                 }
             }
@@ -792,6 +980,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_skills_show_command() {
+        let args = vec![
+            "skills".to_string(),
+            "show".to_string(),
+            "--name".to_string(),
+            "developer".to_string(),
+        ];
+
+        let command = parse_command(&args).expect("command should parse");
+
+        assert_eq!(
+            command,
+            Command::Skills(SkillsCommand::Show(SkillShowOptions {
+                name: "developer".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_skills_validate_command() {
+        let args = vec![
+            "skills".to_string(),
+            "validate".to_string(),
+            "--name".to_string(),
+            "developer".to_string(),
+        ];
+
+        let command = parse_command(&args).expect("command should parse");
+
+        assert_eq!(
+            command,
+            Command::Skills(SkillsCommand::Validate(SkillValidateOptions {
+                name: Some("developer".to_string()),
+            }))
+        );
+    }
+
+    #[test]
     fn parses_compact_command() {
         let command = parse_command(&["compact".to_string()]).expect("command should parse");
 
@@ -875,6 +1101,70 @@ mod tests {
     }
 
     #[test]
+    fn load_system_prompt_from_dir_reads_sorted_non_hidden_files() {
+        let root = temp_root("system-prompt");
+        fs::write(root.join("20-style.md"), "Keep context compact.").expect("style prompt");
+        fs::write(
+            root.join("10-role.md"),
+            "You are a harness-first coding agent.",
+        )
+        .expect("role prompt");
+        fs::write(root.join(".ignored.md"), "hidden").expect("hidden file");
+        fs::create_dir_all(root.join("nested")).expect("nested dir");
+        fs::write(root.join("nested").join("30-nested.md"), "nested").expect("nested file");
+
+        let prompt = load_system_prompt_from_dir(&root).expect("prompt should load");
+
+        assert_eq!(
+            prompt,
+            "You are a harness-first coding agent.\n\nKeep context compact."
+        );
+    }
+
+    #[test]
+    fn load_system_prompt_from_dir_rejects_empty_directories() {
+        let root = temp_root("system-prompt-empty");
+
+        let error = load_system_prompt_from_dir(&root).expect_err("empty prompt dir should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("No system prompt files found"));
+    }
+
+    #[test]
+    fn resolve_system_prompt_prefers_explicit_then_env_then_directory() {
+        let root = temp_root("system-prompt-precedence");
+        fs::write(root.join("system_prompt.md"), "folder prompt").expect("folder prompt");
+
+        let explicit = resolve_system_prompt_from_sources(
+            Some("explicit prompt".to_string()),
+            Some("env prompt".to_string()),
+            &root,
+        )
+        .expect("explicit prompt should win");
+        let env_prompt =
+            resolve_system_prompt_from_sources(None, Some("env prompt".to_string()), &root)
+                .expect("env prompt should win");
+        let folder_prompt = resolve_system_prompt_from_sources(None, None, &root)
+            .expect("folder prompt should load");
+
+        assert_eq!(explicit, "explicit prompt");
+        assert_eq!(env_prompt, "env prompt");
+        assert_eq!(folder_prompt, "folder prompt");
+    }
+
+    #[test]
+    fn resolve_system_prompt_falls_back_to_default_when_directory_is_missing() {
+        let root = temp_root("system-prompt-missing");
+        let missing = root.join("missing");
+
+        let prompt = resolve_system_prompt_from_sources(None, None, &missing)
+            .expect("missing dir should use built-in fallback");
+
+        assert_eq!(prompt, DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
     fn build_eval_suite_errors_when_fixture_dir_is_empty() {
         let fixture_dir = temp_root("eval-empty");
         let agent =
@@ -913,7 +1203,7 @@ mod tests {
                 "name": "retry fails as finish",
                 "user_input": "retry the request",
                 "observations": [
-                    "Recoverable tool failure from `web_search`: timeout"
+                    "Recoverable tool failure from `web_search_tool`: timeout"
                 ],
                 "expected": {
                     "action": "finish"
@@ -939,5 +1229,53 @@ mod tests {
         assert!(!suite.cases[1].passed);
         assert_eq!(suite.cases[0].actual.action, "stop");
         assert_eq!(suite.cases[1].actual.action, "retry");
+    }
+
+    #[test]
+    fn sprint_v2_scaffolding_identifies_openclaw_gap_doc_target() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let prd_path = repo_root.join("sprints/v2/PRD.md");
+        let tasks_path = repo_root.join("sprints/v2/TASKS.md");
+        let gap_doc_path = repo_root.join("docs/openclaw-gap.md");
+
+        assert!(prd_path.is_file(), "expected {:?} to exist", prd_path);
+        assert!(tasks_path.is_file(), "expected {:?} to exist", tasks_path);
+        assert!(
+            gap_doc_path.is_file(),
+            "expected {:?} to exist",
+            gap_doc_path
+        );
+
+        let gap_doc = fs::read_to_string(&gap_doc_path).expect("gap doc should be readable");
+        assert!(
+            gap_doc.contains("OpenClaw") && gap_doc.contains("gap"),
+            "gap doc should identify the OpenClaw gap-analysis target"
+        );
+    }
+
+    #[test]
+    fn sprint_v2_gap_doc_compares_current_harness_to_target_architecture() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let gap_doc_path = repo_root.join("docs/openclaw-gap.md");
+        let gap_doc = fs::read_to_string(&gap_doc_path).expect("gap doc should be readable");
+
+        for required_phrase in [
+            "Current Harness",
+            "Target OpenClaw-Style Architecture",
+            "Migration Seams",
+            "bus",
+            "channel",
+            "routing",
+            "scheduler",
+            "dispatch",
+            "prompt layer",
+            "concurrency",
+            "memory-agent",
+        ] {
+            assert!(
+                gap_doc.contains(required_phrase),
+                "gap doc should mention `{required_phrase}`"
+            );
+        }
     }
 }

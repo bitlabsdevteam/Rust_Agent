@@ -74,7 +74,8 @@ pub fn load_eval_fixtures(_dir: &Path) -> io::Result<Vec<PlannerEvalFixture>> {
         .collect::<Vec<_>>();
     paths.sort();
 
-    paths.into_iter()
+    paths
+        .into_iter()
         .map(|path| {
             let contents = fs::read_to_string(&path)?;
             parse_eval_fixture(&contents)
@@ -137,10 +138,7 @@ impl PlannerEvalExpectedDecision {
 
     pub fn summary(&self) -> String {
         match self.action.as_str() {
-            "tool" => format!(
-                "tool:{}",
-                self.tool_name.as_deref().unwrap_or("<missing>")
-            ),
+            "tool" => format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>")),
             "skill" => format!(
                 "skill:{}",
                 self.skill_name.as_deref().unwrap_or("<missing>")
@@ -157,10 +155,7 @@ impl PlannerEvalExpectedDecision {
 impl PlannerEvalActualDecision {
     pub fn summary(&self) -> String {
         match self.action.as_str() {
-            "tool" => format!(
-                "tool:{}",
-                self.tool_name.as_deref().unwrap_or("<missing>")
-            ),
+            "tool" => format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>")),
             "skill" => format!(
                 "skill:{}",
                 self.skill_name.as_deref().unwrap_or("<missing>")
@@ -201,7 +196,10 @@ impl PlannerEvalSuiteResult {
                 ));
             } else {
                 lines.push(format!("[FAIL] {}", case.fixture.name));
-                lines.push(format!("  input: {}", render_text_block(&case.fixture.user_input)));
+                lines.push(format!(
+                    "  input: {}",
+                    render_text_block(&case.fixture.user_input)
+                ));
                 lines.push(format!(
                     "  observations: {}",
                     render_observations(&case.fixture.observations)
@@ -276,7 +274,7 @@ mod tests {
                 "observations": ["No observations recorded yet."],
                 "expected": {
                     "action": "tool",
-                    "tool_name": "web_search"
+                    "tool_name": "web_search_tool"
                 }
             }"#,
         )
@@ -289,7 +287,10 @@ mod tests {
         );
         assert_eq!(fixture.observations.len(), 1);
         assert_eq!(fixture.expected.action, "tool");
-        assert_eq!(fixture.expected.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(
+            fixture.expected.tool_name.as_deref(),
+            Some("web_search_tool")
+        );
     }
 
     #[test]
@@ -347,7 +348,7 @@ mod tests {
                 "user_input": "search the web",
                 "expected": {
                     "action": "tool",
-                    "tool_name": "web_search"
+                    "tool_name": "web_search_tool"
                 }
             }"#,
         )
@@ -364,13 +365,13 @@ mod tests {
     fn expected_decision_matches_tool_route() {
         let expected = PlannerEvalExpectedDecision {
             action: "tool".to_string(),
-            tool_name: Some("web_search".to_string()),
+            tool_name: Some("web_search_tool".to_string()),
             skill_name: None,
             subagent_name: None,
         };
         let actual = PlannerEvalActualDecision {
             action: "tool".to_string(),
-            tool_name: Some("web_search".to_string()),
+            tool_name: Some("web_search_tool".to_string()),
             skill_name: None,
             subagent_name: None,
             reason: "explicit tool request".to_string(),
@@ -389,7 +390,7 @@ mod tests {
             observations: Vec::new(),
             expected: PlannerEvalExpectedDecision {
                 action: "tool".to_string(),
-                tool_name: Some("web_search".to_string()),
+                tool_name: Some("web_search_tool".to_string()),
                 skill_name: None,
                 subagent_name: None,
             },
@@ -398,7 +399,7 @@ mod tests {
             fixture: fixture.clone(),
             actual: PlannerEvalActualDecision {
                 action: "tool".to_string(),
-                tool_name: Some("web_search".to_string()),
+                tool_name: Some("web_search_tool".to_string()),
                 skill_name: None,
                 subagent_name: None,
                 reason: "explicit tool request".to_string(),
@@ -432,7 +433,7 @@ mod tests {
         assert!(report.contains("Planner evals: 1 passed, 1 failed"));
         assert!(report.contains("[PASS] tool routing"));
         assert!(report.contains("[FAIL] tool routing"));
-        assert!(report.contains("expected: tool:web_search"));
+        assert!(report.contains("expected: tool:web_search_tool"));
         assert!(report.contains("actual: delegate:general-purpose"));
         assert!(report.contains("input: search the web"));
         assert!(report.contains("planner backend: local heuristic planner"));

@@ -11,10 +11,14 @@ use crate::mcp::McpToolRegistration;
 use serde_json::Value;
 use web_search_tool_perplexity::tool_web_search_perplexity;
 
+pub const WEB_SEARCH_TOOL_NAME: &str = "web_search_tool";
+pub const LEGACY_WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
 type BuiltInToolHandler = fn(&str, &Value) -> StepOutcome;
 
 pub struct Tool {
     name: String,
+    aliases: Vec<String>,
     description: String,
     planner_description: String,
     handler: ToolHandler,
@@ -23,6 +27,7 @@ pub struct Tool {
 impl Tool {
     fn built_in(
         name: impl Into<String>,
+        aliases: Vec<String>,
         description: impl Into<String>,
         handler: BuiltInToolHandler,
     ) -> Self {
@@ -30,6 +35,7 @@ impl Tool {
         let description = description.into();
         Self {
             name: name.clone(),
+            aliases,
             planner_description: format!("{}: {}", name, description),
             description,
             handler: ToolHandler::BuiltIn(handler),
@@ -39,6 +45,7 @@ impl Tool {
     pub fn from_mcp(registration: McpToolRegistration) -> Self {
         Self {
             name: registration.local_name.clone(),
+            aliases: Vec::new(),
             description: registration.description.clone(),
             planner_description: registration.planning_description(),
             handler: ToolHandler::Mcp(registration),
@@ -74,7 +81,7 @@ impl Tool {
     }
 
     pub fn is_named(&self, name: &str) -> bool {
-        self.name == name
+        self.name == name || self.aliases.iter().any(|alias| alias == name)
     }
 }
 
@@ -86,7 +93,8 @@ enum ToolHandler {
 pub fn default_tools() -> Vec<Tool> {
     vec![
         Tool::built_in(
-            "web_search",
+            WEB_SEARCH_TOOL_NAME,
+            vec![LEGACY_WEB_SEARCH_TOOL_NAME.to_string()],
             "Run grounded web research through the Perplexity Sonar API and return an answer with citations.",
             tool_web_search_perplexity,
         ),

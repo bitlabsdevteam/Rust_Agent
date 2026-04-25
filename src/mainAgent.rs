@@ -1,7 +1,13 @@
+use crate::dispatch::{DispatchRequest, DispatchResponse, Dispatcher, LocalDispatcher};
 use crate::evals::PlannerEvalActualDecision;
 use crate::mcp::{load_mcp_catalog_from_env, McpServerSummary};
+use crate::memory_agent::{FileMemoryAgent, MemoryAgent, MemoryAgentSnapshot};
 use crate::observability::{self, Observability};
-use crate::Tools::{default_tools, Tool};
+use crate::prompt_layers::{
+    ActiveSkillLayer, ChannelMetadataLayer, ObservationLayer, PlannerPromptLayers,
+    ProjectMemoryLayer, SystemPromptLayer, TaskContractLayer,
+};
+use crate::Tools::{default_tools, Tool, LEGACY_WEB_SEARCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
 use opentelemetry::KeyValue;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -35,6 +41,8 @@ const RETAINED_RECENT_HISTORY_ITEMS: usize = 4;
 const MAX_COMPACTED_SUMMARY_CHARS: usize = 1_600;
 const MAX_RELEVANT_FILES: usize = 5;
 const PROJECT_MEMORY_FILE: &str = "CLAUDE.md";
+const SYSTEM_PROMPT_DIR: &str = "system_prompt";
+const SYSTEM_PROMPT_FILE: &str = "system_prompt.md";
 const CLAUDE_DIR: &str = ".claude";
 const AGENTS_DIR: &str = "agents";
 const COMMANDS_DIR: &str = "commands";
@@ -42,12 +50,15 @@ const SKILLS_DIR: &str = "skills";
 const WORKSPACE_DIR: &str = "Workspace";
 const SHORT_TERM_MEMORY_FILE: &str = "short-term.json";
 const LONG_TERM_MEMORY_FILE: &str = "MEMORY.md";
+const HISTORY_DIR: &str = "history";
+const CONTEXT_HISTORY_FILE: &str = "context_history.json";
 const MAX_SHORT_TERM_HISTORY_ITEMS: usize = 8;
 const MAX_LONG_TERM_MEMORY_ITEMS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepOutcome {
     Success(String),
+    SkillActivated(SkillActivation),
     Retry(String),
 }
 
@@ -55,6 +66,7 @@ impl fmt::Display for StepOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Success(output) => write!(f, "success: {output}"),
+            Self::SkillActivated(activation) => write!(f, "skill activated: {}", activation.name),
             Self::Retry(reason) => write!(f, "retry: {reason}"),
         }
     }
@@ -139,6 +151,7 @@ struct SessionState {
     trace: Vec<String>,
     compacted_summary: Option<String>,
     observations: Vec<String>,
+    active_skill: Option<ActiveSkill>,
 }
 
 impl SessionState {
@@ -155,6 +168,7 @@ impl SessionState {
         self.trace.clear();
         self.compacted_summary = None;
         self.observations.clear();
+        self.active_skill = None;
     }
 }
 
@@ -414,11 +428,40 @@ impl Mem0Config {
     }
 }
 
+struct Mem0MemoryAgent<'a> {
+    config: &'a Mem0Config,
+}
+
+impl<'a> Mem0MemoryAgent<'a> {
+    fn new(config: &'a Mem0Config) -> Self {
+        Self { config }
+    }
+}
+
+impl MemoryAgent for Mem0MemoryAgent<'_> {
+    fn backend_label(&self) -> &str {
+        "Mem0"
+    }
+
+    fn read_long_term_memory(&self) -> io::Result<MemoryAgentSnapshot> {
+        let source = self.config.fetch_long_term_memory()?;
+        Ok(MemoryAgentSnapshot {
+            path: source.path,
+            contents: source.contents,
+        })
+    }
+
+    fn append_long_term_note(&self, note: &str) -> io::Result<()> {
+        self.config.append_long_term_memory(note)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ShortTermMemorySnapshot {
     compacted_summary: Option<String>,
     observations: Vec<String>,
     recent_history: Vec<ConversationMessage>,
+    active_skill: Option<ActiveSkill>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,55 +531,49 @@ pub struct SkillSpec {
     pub name: String,
     pub description: String,
     pub instructions: String,
+    pub version: Option<String>,
+    pub tags: Vec<String>,
+    pub when_to_use: Option<String>,
+    pub when_not_to_use: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub preferred_subagents: Vec<String>,
+    pub input_contract: Option<String>,
+    pub output_contract: Option<String>,
     pub scope: String,
     pub source_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DelegationRequest {
-    pub subagent: String,
-    pub context_packet: ContextPacket,
-    pub memory_refs: Vec<String>,
-    pub file_refs: Vec<String>,
-    pub observations: Vec<String>,
-    pub task: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSkill {
+    pub name: String,
+    pub source_path: PathBuf,
+    pub activated_by: String,
+    pub task_fit: String,
+    pub allowed_tools: Option<Vec<String>>,
+    pub preferred_subagents: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DelegationResult {
-    pub summary: String,
-    pub findings: Vec<String>,
-    pub artifact_refs: Vec<String>,
-    pub recommended_next_action: String,
-    pub final_text: String,
-    pub usage: Vec<TokenUsageRecord>,
+pub struct SkillActivation {
+    pub name: String,
+    pub source_path: PathBuf,
+    pub scope: String,
+    pub activated_by: String,
+    pub task_fit: String,
+    pub allowed_tools: Option<Vec<String>>,
+    pub preferred_subagents: Vec<String>,
 }
 
-impl DelegationResult {
-    fn render(&self) -> String {
-        let findings = if self.findings.is_empty() {
-            "- none".to_string()
-        } else {
-            self.findings
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let artifacts = if self.artifact_refs.is_empty() {
-            "- none".to_string()
-        } else {
-            self.artifact_refs
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        format!(
-            "{}\n\nFindings:\n{}\n\nArtifacts:\n{}\n\nNext action: {}",
-            self.final_text, findings, artifacts, self.recommended_next_action
-        )
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillValidationIssue {
+    path: PathBuf,
+    message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LoadedSkills {
+    entries: BTreeMap<String, SkillSpec>,
+    issues: Vec<SkillValidationIssue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -693,6 +730,7 @@ pub struct MainAgent {
     short_term_memory: ShortTermMemorySnapshot,
     subagents: BTreeMap<String, SubagentSpec>,
     skills: BTreeMap<String, SkillSpec>,
+    skill_validation_issues: Vec<SkillValidationIssue>,
     commands: BTreeMap<String, CustomCommand>,
 }
 
@@ -748,6 +786,7 @@ impl MainAgent {
             short_term_memory: ShortTermMemorySnapshot::default(),
             subagents: BTreeMap::new(),
             skills: BTreeMap::new(),
+            skill_validation_issues: Vec::new(),
             commands: BTreeMap::new(),
         };
         agent.memory_paths = agent_memory_paths(&agent.root_dir);
@@ -849,7 +888,14 @@ impl MainAgent {
             load_memory_stack(&self.root_dir, self.home_dir.as_deref(), self.mem0.as_ref())?;
         self.short_term_memory = load_short_term_memory(&self.memory_paths.short_term_snapshot)?;
         self.subagents = load_subagent_specs(&self.root_dir, self.home_dir.as_deref())?;
-        self.skills = load_skill_specs(&self.root_dir, self.home_dir.as_deref())?;
+        let loaded_skills = load_skill_specs(
+            &self.root_dir,
+            self.home_dir.as_deref(),
+            &self.tools,
+            &self.subagents,
+        )?;
+        self.skills = loaded_skills.entries;
+        self.skill_validation_issues = loaded_skills.issues;
         self.commands = load_custom_commands(&self.root_dir, self.home_dir.as_deref())?;
         Ok(())
     }
@@ -942,6 +988,7 @@ impl MainAgent {
             trace: Vec::new(),
             compacted_summary: snapshot.compacted_summary,
             observations: snapshot.observations,
+            active_skill: snapshot.active_skill,
         }
     }
 
@@ -974,6 +1021,10 @@ impl MainAgent {
                     ),
                     format!("Loaded {} subagent spec(s).", self.subagents.len()),
                     format!("Loaded {} skill spec(s).", self.skills.len()),
+                    format!(
+                        "Skipped {} invalid skill file(s).",
+                        self.skill_validation_issues.len()
+                    ),
                     format!("Loaded {} custom command(s).", self.commands.len()),
                 ];
                 let compaction = compact_session_state(state, false);
@@ -1017,6 +1068,7 @@ impl MainAgent {
                             state.record(entry.clone());
                         }
                         state.observations = observations;
+                        state.active_skill = None;
                         self.persist_short_term_memory(state, &mut trace);
                         return AgentResult::stopped(reason, trace, usage);
                     }
@@ -1054,6 +1106,14 @@ impl MainAgent {
                             observability::compact_text(observation, 240)
                         ));
                     }
+                    if let Some(active_skill) = &state.active_skill {
+                        trace.push(format!(
+                            "Iteration {step_count}: active skill = `{}` (activated_by={}, task_fit={}).",
+                            active_skill.name,
+                            active_skill.activated_by,
+                            active_skill.task_fit
+                        ));
+                    }
                     if retry_count > 0 {
                         trace.push(format!(
                             "Iteration {step_count}: retry budget used {retry_count}/{}.",
@@ -1089,7 +1149,12 @@ impl MainAgent {
                             trace.push(format!(
                                 "Iteration {step_count}: executing tool `{tool_name}` because {reason}"
                             ));
-                            match self.call_tool(&tool_name, input, &arguments) {
+                            match self.call_tool(
+                                &tool_name,
+                                input,
+                                &arguments,
+                                state.active_skill.as_ref(),
+                            ) {
                                 StepOutcome::Success(output) => {
                                     let observation =
                                         format!("Tool `{tool_name}` observation:\n{output}");
@@ -1127,24 +1192,47 @@ impl MainAgent {
                                             state.record(entry.clone());
                                         }
                                         state.observations = observations;
+                                        state.active_skill = None;
                                         self.persist_short_term_memory(state, &mut trace);
                                         return AgentResult::stopped(stop_reason, trace, usage);
                                     }
+                                }
+                                StepOutcome::SkillActivated(_) => {
+                                    observations.push(format!(
+                                        "Recoverable tool failure from `{tool_name}`: tool execution returned a skill activation unexpectedly"
+                                    ));
                                 }
                             }
                         }
                         Decision::UseSkill { skill_name, reason } => {
                             trace.push(format!(
-                                "Iteration {step_count}: loading skill `{skill_name}` because {reason}"
+                                "Iteration {step_count}: activating skill `{skill_name}` because {reason}"
                             ));
-                            match self.apply_skill(&skill_name, input) {
-                                StepOutcome::Success(output) => {
-                                    observations.push(format!(
-                                        "Skill `{skill_name}` observation:\n{output}"
-                                    ));
+                            match self.apply_skill(&skill_name, input, "planner") {
+                                StepOutcome::SkillActivated(activation) => {
+                                    let was_replaced = state.active_skill.as_ref().map(|skill| skill.name.clone());
+                                    state.active_skill = Some(ActiveSkill {
+                                        name: activation.name.clone(),
+                                        source_path: activation.source_path.clone(),
+                                        activated_by: activation.activated_by.clone(),
+                                        task_fit: activation.task_fit.clone(),
+                                        allowed_tools: activation.allowed_tools.clone(),
+                                        preferred_subagents: activation.preferred_subagents.clone(),
+                                    });
                                     trace.push(format!(
-                                        "Iteration {step_count}: skill observation recorded."
+                                        "Iteration {step_count}: active skill is now `{}` [{}] from {}.",
+                                        activation.name,
+                                        activation.scope,
+                                        activation.source_path.display()
                                     ));
+                                    if let Some(previous) = was_replaced {
+                                        if previous != activation.name {
+                                            trace.push(format!(
+                                                "Iteration {step_count}: replaced previously active skill `{previous}`."
+                                            ));
+                                        }
+                                    }
+                                    continue;
                                 }
                                 StepOutcome::Retry(reason) => {
                                     retry_count += 1;
@@ -1175,9 +1263,13 @@ impl MainAgent {
                                             state.record(entry.clone());
                                         }
                                         state.observations = observations;
+                                        state.active_skill = None;
                                         self.persist_short_term_memory(state, &mut trace);
                                         return AgentResult::stopped(stop_reason, trace, usage);
                                     }
+                                }
+                                StepOutcome::Success(output) => {
+                                    observations.push(output);
                                 }
                             }
                         }
@@ -1227,6 +1319,7 @@ impl MainAgent {
                                             state.record(entry.clone());
                                         }
                                         state.observations = observations;
+                                        state.active_skill = None;
                                         self.persist_short_term_memory(state, &mut trace);
                                         return AgentResult::stopped(stop_reason, trace, usage);
                                     }
@@ -1242,6 +1335,7 @@ impl MainAgent {
                                 .history
                                 .push(ConversationMessage::assistant(answer.clone()));
                             state.observations = observations;
+                            state.active_skill = None;
                             self.persist_short_term_memory(state, &mut trace);
                             if usage.is_empty() {
                                 usage.push(TokenUsageRecord::zero(
@@ -1282,6 +1376,7 @@ impl MainAgent {
                                     state.record(entry.clone());
                                 }
                                 state.observations = observations;
+                                state.active_skill = None;
                                 self.persist_short_term_memory(state, &mut trace);
                                 return AgentResult::stopped(stop_reason, trace, usage);
                             }
@@ -1303,6 +1398,7 @@ impl MainAgent {
                                 state.record(entry.clone());
                             }
                             state.observations = observations;
+                            state.active_skill = None;
                             self.persist_short_term_memory(state, &mut trace);
                             return AgentResult::stopped(reason, trace, usage);
                         }
@@ -1322,11 +1418,13 @@ impl MainAgent {
     ) -> PlannerRun {
         if let Some(engine) = &self.llm_engine {
             match engine.plan(
+                &self.root_dir,
                 &self.config,
                 &self.memory_stack.merged_instructions,
                 &self.tools,
                 &self.subagents,
                 &self.skills,
+                state.active_skill.as_ref(),
                 state,
                 input,
                 task_contract,
@@ -1337,11 +1435,13 @@ impl MainAgent {
                 Err(reason) => {
                     if let Some(engine) = &self.fallback_engine {
                         match engine.plan(
+                            &self.root_dir,
                             &self.config,
                             &self.memory_stack.merged_instructions,
                             &self.tools,
                             &self.subagents,
                             &self.skills,
+                            state.active_skill.as_ref(),
                             state,
                             input,
                             task_contract,
@@ -1361,6 +1461,7 @@ impl MainAgent {
                                     &self.tools,
                                     &self.subagents,
                                     &self.skills,
+                                    state.active_skill.as_ref(),
                                     observations,
                                 );
                                 fallback
@@ -1384,6 +1485,7 @@ impl MainAgent {
                         &self.tools,
                         &self.subagents,
                         &self.skills,
+                        state.active_skill.as_ref(),
                         observations,
                     );
                     fallback.reasoning.push(format!(
@@ -1396,11 +1498,13 @@ impl MainAgent {
 
         if let Some(engine) = &self.fallback_engine {
             match engine.plan(
+                &self.root_dir,
                 &self.config,
                 &self.memory_stack.merged_instructions,
                 &self.tools,
                 &self.subagents,
                 &self.skills,
+                state.active_skill.as_ref(),
                 state,
                 input,
                 task_contract,
@@ -1414,6 +1518,7 @@ impl MainAgent {
                         &self.tools,
                         &self.subagents,
                         &self.skills,
+                        state.active_skill.as_ref(),
                         observations,
                     );
                     fallback.reasoning.push(format!(
@@ -1430,31 +1535,163 @@ impl MainAgent {
             &self.tools,
             &self.subagents,
             &self.skills,
+            state.active_skill.as_ref(),
             observations,
         )
     }
 
-    fn call_tool(&self, name: &str, user_input: &str, arguments: &Value) -> StepOutcome {
+    fn call_tool(
+        &self,
+        name: &str,
+        user_input: &str,
+        arguments: &Value,
+        active_skill: Option<&ActiveSkill>,
+    ) -> StepOutcome {
+        if let Some(skill) = active_skill {
+            if let Some(allowed_tools) = &skill.allowed_tools {
+                if !allowed_tools
+                    .iter()
+                    .map(|tool_name| normalize_tool_name(tool_name))
+                    .any(|tool_name| tool_name == name)
+                {
+                    return StepOutcome::Retry(format!(
+                        "Active skill `{}` does not allow tool `{name}`. Allowed tools: {}.",
+                        skill.name,
+                        allowed_tools.join(", ")
+                    ));
+                }
+            }
+        }
         match self.tools.iter().find(|tool| tool.is_named(name)) {
             Some(tool) => tool.run(user_input, arguments),
             None => StepOutcome::Retry(format!("Unknown tool `{name}`.")),
         }
     }
 
-    fn apply_skill(&self, skill_name: &str, task: &str) -> StepOutcome {
+    fn apply_skill(&self, skill_name: &str, task: &str, activated_by: &str) -> StepOutcome {
         let Some(skill) = self.skills.get(skill_name) else {
             return StepOutcome::Retry(format!("Unknown skill `{skill_name}`."));
         };
 
-        StepOutcome::Success(format!(
-            "Loaded skill `{}` [{}] from {}.\nDescription: {}\n\nInstructions:\n{}\n\nTask fit: {}",
-            skill.name,
-            skill.scope,
-            skill.source_path.display(),
-            skill.description,
-            skill.instructions,
-            observability::compact_text(task, 240)
-        ))
+        StepOutcome::SkillActivated(SkillActivation {
+            name: skill.name.clone(),
+            source_path: skill.source_path.clone(),
+            scope: skill.scope.clone(),
+            activated_by: activated_by.to_string(),
+            task_fit: observability::compact_text(task, 240),
+            allowed_tools: skill.allowed_tools.clone(),
+            preferred_subagents: skill.preferred_subagents.clone(),
+        })
+    }
+
+    fn render_skill_details(&self, skill_name: &str) -> io::Result<String> {
+        let Some(skill) = self.skills.get(skill_name) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Unknown skill `{skill_name}`."),
+            ));
+        };
+
+        let lines = vec![
+            format!("Skill: {}", skill.name),
+            format!("Scope: {}", skill.scope),
+            format!("Path: {}", skill.source_path.display()),
+            format!("Description: {}", skill.description),
+            format!(
+                "Version: {}",
+                skill.version.as_deref().unwrap_or("unspecified")
+            ),
+            format!(
+                "Tags: {}",
+                if skill.tags.is_empty() {
+                    "none".to_string()
+                } else {
+                    skill.tags.join(", ")
+                }
+            ),
+            format!(
+                "Allowed tools: {}",
+                skill
+                    .allowed_tools
+                    .as_ref()
+                    .map(|items| items.join(", "))
+                    .unwrap_or_else(|| "inherit all visible tools".to_string())
+            ),
+            format!(
+                "Preferred subagents: {}",
+                if skill.preferred_subagents.is_empty() {
+                    "none".to_string()
+                } else {
+                    skill.preferred_subagents.join(", ")
+                }
+            ),
+            format!(
+                "Use when: {}",
+                skill.when_to_use.as_deref().unwrap_or("not specified")
+            ),
+            format!(
+                "Do not use when: {}",
+                skill.when_not_to_use.as_deref().unwrap_or("not specified")
+            ),
+            format!(
+                "Input contract: {}",
+                skill.input_contract.as_deref().unwrap_or("not specified")
+            ),
+            format!(
+                "Output contract: {}",
+                skill.output_contract.as_deref().unwrap_or("not specified")
+            ),
+            String::new(),
+            "Instructions:".to_string(),
+            skill.instructions.clone(),
+        ];
+        Ok(lines.join("\n"))
+    }
+
+    fn render_skill_validation(&self, skill_name: Option<&str>) -> String {
+        let mut lines = vec!["Skill validation:".to_string()];
+        let mut matched = false;
+
+        for issue in &self.skill_validation_issues {
+            if let Some(skill_name) = skill_name {
+                let expected = format!("/{skill_name}/");
+                let path_text = issue.path.to_string_lossy();
+                if !path_text.contains(&expected)
+                    && !path_text.ends_with(&format!("/{skill_name}/SKILL.md"))
+                {
+                    continue;
+                }
+            }
+            matched = true;
+            lines.push(format!(
+                "- ERROR {} :: {}",
+                issue.path.display(),
+                issue.message
+            ));
+        }
+
+        if let Some(skill_name) = skill_name {
+            if self.skills.contains_key(skill_name) {
+                matched = true;
+                lines.push(format!("- OK `{skill_name}` loaded successfully."));
+            }
+        } else {
+            for spec in self.skills.values() {
+                lines.push(format!(
+                    "- OK `{}` [{}] {}",
+                    spec.name,
+                    spec.scope,
+                    spec.source_path.display()
+                ));
+            }
+            matched = true;
+        }
+
+        if !matched {
+            lines.push("- No matching skill was found.".to_string());
+        }
+
+        lines.join("\n")
     }
 
     fn delegate_to_subagent(
@@ -1462,7 +1699,7 @@ impl MainAgent {
         subagent_name: &str,
         state: &SessionState,
         task: &str,
-    ) -> Result<DelegationResult, String> {
+    ) -> Result<DispatchResponse, String> {
         let spec = self
             .subagents
             .get(subagent_name)
@@ -1498,21 +1735,23 @@ impl MainAgent {
             .into_iter()
             .rev()
             .collect::<Vec<_>>();
-        let request = DelegationRequest {
-            subagent: spec.name.clone(),
+        let request = DispatchRequest::for_subagent(
+            "main-worker",
+            spec.name.clone(),
+            task.to_string(),
             context_packet,
             memory_refs,
             file_refs,
             observations,
-            task: task.to_string(),
-        };
+        );
+        let dispatcher = LocalDispatcher::new(|request| Ok(execute_subagent(spec, request)));
         self.observability.with_span(
             format!("subagent.{}", spec.name),
             vec![
                 KeyValue::new("subagent.name", spec.name.clone()),
                 KeyValue::new("subagent.scope", spec.scope.clone()),
             ],
-            || Ok(execute_subagent(spec, request)),
+            || dispatcher.dispatch(request.clone()),
         )
     }
 
@@ -1658,9 +1897,36 @@ impl MainAgent {
                 Ok(CommandOutcome::Continue(self.run_review(state, &task)))
             }
             SlashCommand::Skill { name, task } => Ok(CommandOutcome::Continue(
-                match self.apply_skill(&name, &task) {
-                    StepOutcome::Success(output) => output,
+                match self.apply_skill(&name, &task, "user") {
+                    StepOutcome::SkillActivated(activation) => {
+                        state.active_skill = Some(ActiveSkill {
+                            name: activation.name.clone(),
+                            source_path: activation.source_path.clone(),
+                            activated_by: activation.activated_by.clone(),
+                            task_fit: activation.task_fit.clone(),
+                            allowed_tools: activation.allowed_tools.clone(),
+                            preferred_subagents: activation.preferred_subagents.clone(),
+                        });
+                        format!(
+                            "Activated skill `{}` [{}] from {}.\nTask fit: {}\nAllowed tools: {}\nPreferred subagents: {}",
+                            activation.name,
+                            activation.scope,
+                            activation.source_path.display(),
+                            activation.task_fit,
+                            activation
+                                .allowed_tools
+                                .as_ref()
+                                .map(|items| items.join(", "))
+                                .unwrap_or_else(|| "inherit all visible tools".to_string()),
+                            if activation.preferred_subagents.is_empty() {
+                                "none".to_string()
+                            } else {
+                                activation.preferred_subagents.join(", ")
+                            }
+                        )
+                    }
                     StepOutcome::Retry(reason) => reason,
+                    StepOutcome::Success(output) => output,
                 },
             )),
             SlashCommand::Init => {
@@ -1765,13 +2031,28 @@ impl MainAgent {
         } else {
             for spec in self.skills.values() {
                 lines.push(format!(
-                    "- {} [{}] path={} :: {}",
+                    "- {} [{}] path={} :: {} | allowed_tools={} | preferred_subagents={}",
                     spec.name,
                     spec.scope,
                     spec.source_path.display(),
-                    spec.description
+                    spec.description,
+                    spec.allowed_tools
+                        .as_ref()
+                        .map(|items| items.join(", "))
+                        .unwrap_or_else(|| "inherit all visible tools".to_string()),
+                    if spec.preferred_subagents.is_empty() {
+                        "none".to_string()
+                    } else {
+                        spec.preferred_subagents.join(", ")
+                    }
                 ));
             }
+        }
+        if !self.skill_validation_issues.is_empty() {
+            lines.push(format!(
+                "Validation issues: {} invalid skill file(s) skipped.",
+                self.skill_validation_issues.len()
+            ));
         }
         lines.join("\n")
     }
@@ -1943,6 +2224,14 @@ impl MainAgent {
         self.skills.values().collect()
     }
 
+    pub fn show_skill(&self, skill_name: &str) -> io::Result<String> {
+        self.render_skill_details(skill_name)
+    }
+
+    pub fn validate_skills(&self, skill_name: Option<&str>) -> String {
+        self.render_skill_validation(skill_name)
+    }
+
     pub fn command_summaries(&self) -> Vec<String> {
         self.commands
             .values()
@@ -2055,18 +2344,28 @@ fn parse_explicit_tool_request(input: &str) -> Option<(String, Value)> {
 
 fn infer_tool_request(input: &str, tools: &[Tool]) -> Option<(String, Value, String)> {
     if let Some((tool_name, arguments)) = parse_explicit_tool_request(input) {
+        let normalized_tool_name = normalize_tool_name(&tool_name);
         return Some((
-            tool_name.clone(),
+            normalized_tool_name.clone(),
             arguments,
-            format!("Explicit tool request detected for `{tool_name}`."),
+            if normalized_tool_name == tool_name {
+                format!("Explicit tool request detected for `{tool_name}`.")
+            } else {
+                format!(
+                    "Explicit tool request detected for `{tool_name}` and normalized to `{normalized_tool_name}`."
+                )
+            },
         ));
     }
 
-    if tools.iter().any(|tool| tool.is_named("web_search")) && should_use_web_search(input) {
+    if tools.iter().any(|tool| tool.is_named(WEB_SEARCH_TOOL_NAME)) && should_use_web_search(input)
+    {
         return Some((
-            "web_search".to_string(),
+            WEB_SEARCH_TOOL_NAME.to_string(),
             Value::Object(Default::default()),
-            "Planner inferred `web_search` for an external or time-sensitive query.".to_string(),
+            format!(
+                "Planner inferred `{WEB_SEARCH_TOOL_NAME}` for an external or time-sensitive query."
+            ),
         ));
     }
 
@@ -2244,6 +2543,7 @@ fn heuristic_plan(
     tools: &[Tool],
     subagents: &BTreeMap<String, SubagentSpec>,
     skills: &BTreeMap<String, SkillSpec>,
+    active_skill: Option<&ActiveSkill>,
     observations: &[String],
 ) -> PlannerRun {
     if let Some(observation) = observations.last() {
@@ -2287,15 +2587,41 @@ fn heuristic_plan(
         };
     }
 
-    if let Some((skill_name, route_reason)) = infer_skill_request(input, skills) {
-        return PlannerRun {
-            decision: Decision::UseSkill {
-                skill_name,
-                reason: route_reason.clone(),
-            },
-            reasoning: vec![route_reason],
-            usage: None,
-        };
+    if active_skill.is_none() {
+        if let Some((skill_name, route_reason)) = infer_skill_request(input, skills) {
+            return PlannerRun {
+                decision: Decision::UseSkill {
+                    skill_name,
+                    reason: route_reason.clone(),
+                },
+                reasoning: vec![route_reason],
+                usage: None,
+            };
+        }
+    }
+
+    if let Some(active_skill) = active_skill {
+        if let Some(subagent_name) = active_skill
+            .preferred_subagents
+            .iter()
+            .find(|name| subagents.contains_key(*name))
+            .cloned()
+        {
+            return PlannerRun {
+                decision: Decision::DelegateSubagent {
+                    subagent_name,
+                    reason: format!(
+                        "Active skill `{}` prefers delegated execution through that subagent.",
+                        active_skill.name
+                    ),
+                },
+                reasoning: vec![format!(
+                    "The local heuristic router deferred to the active skill `{}`.",
+                    active_skill.name
+                )],
+                usage: None,
+            };
+        }
     }
 
     let subagent_name =
@@ -2415,31 +2741,35 @@ impl OpenAiEngine {
 
     fn plan(
         &self,
+        root_dir: &Path,
         config: &AgentConfig,
         memory_context: &str,
         tools: &[Tool],
         subagents: &BTreeMap<String, SubagentSpec>,
         skills: &BTreeMap<String, SkillSpec>,
+        active_skill: Option<&ActiveSkill>,
         state: &SessionState,
         user_input: &str,
         task_contract: &TaskContract,
         observations: &[String],
         retry_count: u8,
     ) -> Result<PlannerRun, String> {
+        let planner_prompt = planner_prompt(
+            state,
+            memory_context,
+            tools,
+            subagents,
+            skills,
+            active_skill,
+            task_contract,
+            observations,
+            retry_count,
+        );
+        let planner_input = build_planner_input_from_prompt(state, user_input, &planner_prompt);
         let request = json!({
             "model": self.model,
             "instructions": config.system_prompt,
-            "input": build_planner_input(
-                state,
-                user_input,
-                memory_context,
-                tools,
-                subagents,
-                skills,
-                task_contract,
-                observations,
-                retry_count,
-            ),
+            "input": planner_input,
             "reasoning": {
                 "summary": "auto"
             },
@@ -2452,6 +2782,16 @@ impl OpenAiEngine {
                 }
             }
         });
+        let context_entry = capture_context_history_entry(
+            "OpenAI Responses API",
+            &self.model,
+            &config.system_prompt,
+            &planner_prompt,
+            state,
+            user_input,
+            &request,
+        );
+        emit_context_preview(root_dir, &context_entry);
 
         let response = self.send_json_request(request)?;
         let raw_text = response
@@ -2551,11 +2891,13 @@ impl AnthropicEngine {
 
     fn plan(
         &self,
+        root_dir: &Path,
         config: &AgentConfig,
         memory_context: &str,
         tools: &[Tool],
         subagents: &BTreeMap<String, SubagentSpec>,
         skills: &BTreeMap<String, SkillSpec>,
+        active_skill: Option<&ActiveSkill>,
         state: &SessionState,
         user_input: &str,
         task_contract: &TaskContract,
@@ -2568,6 +2910,7 @@ impl AnthropicEngine {
             tools,
             subagents,
             skills,
+            active_skill,
             task_contract,
             observations,
             retry_count,
@@ -2583,6 +2926,16 @@ impl AnthropicEngine {
                 }
             ]
         });
+        let context_entry = capture_context_history_entry(
+            "Anthropic Messages API",
+            &self.model,
+            &config.system_prompt,
+            &prompt,
+            state,
+            user_input,
+            &request,
+        );
+        emit_context_preview(root_dir, &context_entry);
 
         let response = self.send_json_request(request)?;
         let raw_text = response
@@ -2776,10 +3129,32 @@ struct PlannerPayload {
     reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ApiInputMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ActualContextSnapshot {
+    system_prompt: String,
+    planner_prompt: String,
+    prior_history: Vec<ApiInputMessage>,
+    current_user_input: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FinalContextSnapshot {
+    request_body: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ContextHistoryEntry {
+    datetime: String,
+    provider: String,
+    model: String,
+    actual_context: ActualContextSnapshot,
+    final_context: FinalContextSnapshot,
 }
 
 fn planner_schema() -> Value {
@@ -2802,29 +3177,14 @@ fn planner_schema() -> Value {
     })
 }
 
-fn build_planner_input(
+fn build_planner_input_from_prompt(
     state: &SessionState,
     user_input: &str,
-    memory_context: &str,
-    tools: &[Tool],
-    subagents: &BTreeMap<String, SubagentSpec>,
-    skills: &BTreeMap<String, SkillSpec>,
-    task_contract: &TaskContract,
-    observations: &[String],
-    retry_count: u8,
+    planner_prompt: &str,
 ) -> Vec<ApiInputMessage> {
     let mut messages = vec![ApiInputMessage {
         role: "developer".to_string(),
-        content: planner_prompt(
-            state,
-            memory_context,
-            tools,
-            subagents,
-            skills,
-            task_contract,
-            observations,
-            retry_count,
-        ),
+        content: planner_prompt.to_string(),
     }];
 
     messages.extend(state.history.iter().map(|message| ApiInputMessage {
@@ -2843,17 +3203,125 @@ fn build_planner_input(
     messages
 }
 
+fn context_history_path(root_dir: &Path) -> PathBuf {
+    root_dir.join(HISTORY_DIR).join(CONTEXT_HISTORY_FILE)
+}
+
+fn capture_context_history_entry(
+    provider: &str,
+    model: &str,
+    system_prompt: &str,
+    planner_prompt: &str,
+    state: &SessionState,
+    user_input: &str,
+    request_body: &Value,
+) -> ContextHistoryEntry {
+    ContextHistoryEntry {
+        datetime: iso8601ish_now(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        actual_context: ActualContextSnapshot {
+            system_prompt: system_prompt.to_string(),
+            planner_prompt: planner_prompt.to_string(),
+            prior_history: state
+                .history
+                .iter()
+                .map(|message| ApiInputMessage {
+                    role: match message.role {
+                        MessageRole::User => "user".to_string(),
+                        MessageRole::Assistant => "assistant".to_string(),
+                    },
+                    content: message.content.clone(),
+                })
+                .collect(),
+            current_user_input: user_input.to_string(),
+        },
+        final_context: FinalContextSnapshot {
+            request_body: request_body.clone(),
+        },
+    }
+}
+
+fn render_context_preview(entry: &ContextHistoryEntry, history_path: &Path) -> String {
+    let final_request_json = serde_json::to_string_pretty(&entry.final_context.request_body)
+        .unwrap_or_else(|_| entry.final_context.request_body.to_string());
+    let prior_history = if entry.actual_context.prior_history.is_empty() {
+        "- none".to_string()
+    } else {
+        entry
+            .actual_context
+            .prior_history
+            .iter()
+            .map(|message| format!("- {}: {}", message.role, message.content))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "LLM context preview\n- datetime: {}\n- provider: {}\n- model: {}\n- history file: {}\n\nActual context:\nSystem prompt:\n{}\n\nPlanner prompt:\n{}\n\nPrior history:\n{}\n\nCurrent user input:\n{}\n\nFinal request JSON:\n{}",
+        entry.datetime,
+        entry.provider,
+        entry.model,
+        history_path.display(),
+        entry.actual_context.system_prompt,
+        entry.actual_context.planner_prompt,
+        prior_history,
+        entry.actual_context.current_user_input,
+        final_request_json,
+    )
+}
+
+fn persist_context_history(path: &Path, entry: &ContextHistoryEntry) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut entries = if path.is_file() {
+        let contents = fs::read_to_string(path)?;
+        if contents.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str::<Vec<ContextHistoryEntry>>(&contents)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        }
+    } else {
+        Vec::new()
+    };
+
+    entries.push(entry.clone());
+    let serialized = serde_json::to_string_pretty(&entries)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(path, serialized)
+}
+
+fn emit_context_preview(root_dir: &Path, entry: &ContextHistoryEntry) {
+    let history_path = context_history_path(root_dir);
+    println!("{}", render_context_preview(entry, &history_path));
+    match persist_context_history(&history_path, entry) {
+        Ok(()) => println!("Saved LLM context snapshot to {}.", history_path.display()),
+        Err(error) => crate::runtime_log::warn(
+            "planner",
+            format!(
+                "Failed to persist LLM context snapshot to {}: {}",
+                history_path.display(),
+                error
+            ),
+        ),
+    }
+}
+
 fn planner_prompt(
     state: &SessionState,
     memory_context: &str,
     tools: &[Tool],
     subagents: &BTreeMap<String, SubagentSpec>,
     skills: &BTreeMap<String, SkillSpec>,
+    active_skill: Option<&ActiveSkill>,
     task_contract: &TaskContract,
     observations: &[String],
     retry_count: u8,
 ) -> String {
-    let tool_list = tools
+    let tool_list = visible_tools_for_active_skill(tools, active_skill)
         .iter()
         .map(|tool| format!("- {}", tool.planner_description()))
         .collect::<Vec<_>>()
@@ -2888,57 +3356,79 @@ fn planner_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
-
-    format!(
-        "You are the planner for a harness-first Rust coding agent.\n\
-Choose exactly one next action and return JSON only.\n\
-Rules:\n\
-- Start from the explicit task contract.\n\
-- The harness loop permits exactly one action per iteration.\n\
-- Prefer calling a tool when the user's request requires an available tool now.\n\
-- Prefer using a skill when the request matches a reusable capability pack or the user explicitly asks for one.\n\
-- Prefer delegating to a subagent when the request is exploratory, planning-oriented, or file-focused.\n\
-- Prefer `finish` when the latest observation already contains enough information to answer.\n\
-- Use `retry` only for recoverable failures that gained new information.\n\
-- Use action=`finish` when you can answer directly without a tool or subagent.\n\
-- Use action=`stop` only for terminal conditions.\n\
-- For action=`tool`, set `tool_name` exactly and encode an object in `tool_arguments_json`.\n\
-- For action=`skill`, set `skill_name` exactly.\n\
-- For action=`delegate`, set `subagent_name` exactly.\n\
-- When a field does not apply, leave it empty, except `tool_arguments_json`, which must be `{{}}`.\n\
-- Fill `reason` with a short explanation.\n\
-\n\
-Loaded memory:\n{memory_summary}\n\
-\n\
-Available tools:\n{tool_list}\n\
-\n\
-Available subagents:\n{subagent_list}\n\
-\n\
-Available skills:\n{skill_list}\n\
-\n\
-Task contract:\n\
-- goal: {}\n\
-- constraints: {}\n\
-- acceptance criteria: {}\n\
-- relevant files: {}\n\
-- stop condition: {}\n\
-\n\
-Retry count: {retry_count}\n\
-\n\
-Recorded observations:\n{observation_summary}\n\
-\n\
-Compacted prior history:\n{history_summary}\n"
-        ,
-        task_contract.goal,
-        task_contract.constraints.join(" | "),
-        task_contract.acceptance_criteria.join(" | "),
-        if task_contract.relevant_files.is_empty() {
-            "none inferred".to_string()
-        } else {
-            task_contract.relevant_files.join(", ")
+    let active_skill_layer = active_skill.and_then(|active_skill| {
+        skills
+            .get(&active_skill.name)
+            .map(|skill| ActiveSkillLayer {
+                summary: format!(
+                    "{} activated_by={} task_fit={} allowed_tools={} preferred_subagents={}",
+                    active_skill.name,
+                    active_skill.activated_by,
+                    active_skill.task_fit,
+                    active_skill
+                        .allowed_tools
+                        .as_ref()
+                        .map(|items| items.join(", "))
+                        .unwrap_or_else(|| "inherit all visible tools".to_string()),
+                    if active_skill.preferred_subagents.is_empty() {
+                        "none".to_string()
+                    } else {
+                        active_skill.preferred_subagents.join(", ")
+                    }
+                ),
+                instructions: skill
+                    .instructions
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            })
+    });
+    PlannerPromptLayers {
+        system: SystemPromptLayer {
+            instructions: "You are the planner for a harness-first Rust coding agent.\nChoose exactly one next action and return JSON only.\nRules:\n- Start from the explicit task contract.\n- The harness loop permits exactly one action per iteration.\n- Prefer calling a tool when the user's request requires an available tool now.\n- Prefer using a skill when the request matches a reusable capability pack or the user explicitly asks for one.\n- Do not select the same skill again when it is already active; use the active skill to guide the next tool, delegation, stop, retry, or finish decision.\n- Prefer delegating to a subagent when the request is exploratory, planning-oriented, or file-focused.\n- Prefer `finish` when the latest observation already contains enough information to answer.\n- Use `retry` only for recoverable failures that gained new information.\n- Use action=`finish` when you can answer directly without a tool or subagent.\n- Use action=`stop` only for terminal conditions.\n- For action=`tool`, set `tool_name` exactly and encode an object in `tool_arguments_json`.\n- For action=`skill`, set `skill_name` exactly.\n- For action=`delegate`, set `subagent_name` exactly.\n- When a field does not apply, leave it empty, except `tool_arguments_json`, which must be `{}`.\n- Fill `reason` with a short explanation.".to_string(),
         },
-        task_contract.stop_condition,
-    )
+        project_memory: ProjectMemoryLayer {
+            summary: memory_summary,
+        },
+        task_contract: TaskContractLayer {
+            goal: task_contract.goal.clone(),
+            constraints: task_contract.constraints.clone(),
+            acceptance_criteria: task_contract.acceptance_criteria.clone(),
+            relevant_files: task_contract.relevant_files.clone(),
+            stop_condition: task_contract.stop_condition.clone(),
+        },
+        available_skills: if skill_list.is_empty() {
+            Vec::new()
+        } else {
+            skill_list.lines().map(str::to_string).collect()
+        },
+        active_skill: active_skill_layer,
+        observations: ObservationLayer {
+            entries: if observations.is_empty() {
+                Vec::new()
+            } else {
+                observation_summary.lines().map(str::to_string).collect()
+            },
+        },
+        channel_metadata: ChannelMetadataLayer {
+            channel_name: "cli".to_string(),
+            surface: "terminal".to_string(),
+            delivery_mode: "local-session".to_string(),
+        },
+        tool_context: if tool_list.is_empty() {
+            Vec::new()
+        } else {
+            tool_list.lines().map(str::to_string).collect()
+        },
+        subagent_context: if subagent_list.is_empty() {
+            Vec::new()
+        } else {
+            subagent_list.lines().map(str::to_string).collect()
+        },
+        history_summary,
+        retry_count,
+    }
+    .render()
 }
 
 fn planner_payload_to_decision(
@@ -2950,7 +3440,7 @@ fn planner_payload_to_decision(
     let reason = empty_to_default(&payload.reason, "planner did not provide a reason");
     match payload.action.as_str() {
         "tool" => {
-            let tool_name = empty_to_default(&payload.tool_name, "");
+            let tool_name = normalize_tool_name(&empty_to_default(&payload.tool_name, ""));
             if tool_name.is_empty() {
                 return Err("Planner requested a tool without `tool_name`.".to_string());
             }
@@ -3043,7 +3533,28 @@ fn reasoning_summary_for_decision(decision: &Decision) -> String {
     }
 }
 
-fn execute_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+fn visible_tools_for_active_skill<'a>(
+    tools: &'a [Tool],
+    active_skill: Option<&ActiveSkill>,
+) -> Vec<&'a Tool> {
+    let Some(active_skill) = active_skill else {
+        return tools.iter().collect();
+    };
+    let Some(allowed_tools) = &active_skill.allowed_tools else {
+        return tools.iter().collect();
+    };
+
+    tools
+        .iter()
+        .filter(|tool| {
+            allowed_tools
+                .iter()
+                .any(|tool_name| tool.is_named(tool_name))
+        })
+        .collect()
+}
+
+fn execute_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchResponse {
     match spec.name.as_str() {
         "explore" => execute_explore_subagent(spec, request),
         "plan" => execute_plan_subagent(spec, request),
@@ -3051,7 +3562,7 @@ fn execute_subagent(spec: &SubagentSpec, request: DelegationRequest) -> Delegati
     }
 }
 
-fn execute_explore_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+fn execute_explore_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchResponse {
     let files = if request.file_refs.is_empty() {
         vec!["No matching files were inferred.".to_string()]
     } else {
@@ -3061,7 +3572,9 @@ fn execute_explore_subagent(spec: &SubagentSpec, request: DelegationRequest) -> 
         .iter()
         .map(|path| format!("Potentially relevant file: {path}"))
         .collect::<Vec<_>>();
-    DelegationResult {
+    DispatchResponse {
+        dispatch_id: request.dispatch_id,
+        responder: format!("subagent {}", spec.name),
         summary: format!("{} narrowed the task to likely files.", spec.name),
         findings: findings.clone(),
         artifact_refs: files.clone(),
@@ -3088,7 +3601,7 @@ fn execute_explore_subagent(spec: &SubagentSpec, request: DelegationRequest) -> 
     }
 }
 
-fn execute_plan_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+fn execute_plan_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchResponse {
     let steps = vec![
         format!("Load only the files relevant to `{}`.", request.task),
         "Make the smallest coherent change set that matches project memory and commands."
@@ -3100,7 +3613,9 @@ fn execute_plan_subagent(spec: &SubagentSpec, request: DelegationRequest) -> Del
         .into_iter()
         .take(MAX_RELEVANT_FILES)
         .collect::<Vec<_>>();
-    DelegationResult {
+    DispatchResponse {
+        dispatch_id: request.dispatch_id,
+        responder: format!("subagent {}", spec.name),
         summary: format!("{} produced a compact execution plan.", spec.name),
         findings: steps.clone(),
         artifact_refs,
@@ -3123,13 +3638,15 @@ fn execute_plan_subagent(spec: &SubagentSpec, request: DelegationRequest) -> Del
     }
 }
 
-fn execute_general_subagent(spec: &SubagentSpec, request: DelegationRequest) -> DelegationResult {
+fn execute_general_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchResponse {
     let findings = vec![
         format!("Active task: {}", request.task),
         format!("Loaded memory sources: {}", request.memory_refs.len()),
         format!("Relevant files inferred: {}", request.file_refs.len()),
     ];
-    DelegationResult {
+    DispatchResponse {
+        dispatch_id: request.dispatch_id,
+        responder: format!("subagent {}", spec.name),
         summary: format!("{} returned a compact handoff.", spec.name),
         findings: findings.clone(),
         artifact_refs: request.file_refs.clone(),
@@ -3316,12 +3833,7 @@ fn load_memory_stack(
     home_dir: Option<&Path>,
     mem0: Option<&Mem0Config>,
 ) -> io::Result<MemoryStack> {
-    load_memory_stack_with_request(
-        root_dir,
-        home_dir,
-        mem0,
-        &MemoryLoadRequest::default(),
-    )
+    load_memory_stack_with_request(root_dir, home_dir, mem0, &MemoryLoadRequest::default())
 }
 
 fn load_memory_stack_with_request(
@@ -3358,21 +3870,10 @@ fn load_memory_stack_with_request(
         &mut sources,
     )?;
 
-    if let Some(mem0) = mem0 {
-        let mut source = mem0.fetch_long_term_memory()?;
+    let long_term_memory = agent_memory_paths(root_dir).long_term_notes;
+    if let Some(mut source) = read_long_term_memory_via_agent(mem0, &long_term_memory)? {
         source.selector_hint = None;
         sources.push(source);
-    } else {
-        let long_term_memory = agent_memory_paths(root_dir).long_term_notes;
-        load_memory_source(
-            root_dir,
-            &long_term_memory,
-            MemoryScope::Project,
-            Some(project_memory),
-            0,
-            &mut visited,
-            &mut sources,
-        )?;
     }
 
     let merged_instructions = sources
@@ -3416,6 +3917,7 @@ fn save_short_term_memory(path: &Path, state: &SessionState) -> io::Result<()> {
     let snapshot = ShortTermMemorySnapshot {
         compacted_summary: state.compacted_summary.clone(),
         observations: state.observations.clone(),
+        active_skill: state.active_skill.clone(),
         recent_history: state
             .history
             .iter()
@@ -3471,23 +3973,37 @@ fn memory_selector_hint(
 }
 
 fn append_long_term_memory(mem0: Option<&Mem0Config>, path: &Path, note: &str) -> io::Result<()> {
-    if let Some(mem0) = mem0 {
-        return mem0.append_long_term_memory(note);
-    }
+    let agent = long_term_memory_agent(mem0, path);
+    agent.append_long_term_note(&format!("- [{}] {}\n", iso8601ish_now(), note.trim()))
+}
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut contents = if path.is_file() {
-        fs::read_to_string(path)?
+fn long_term_memory_agent<'a>(
+    mem0: Option<&'a Mem0Config>,
+    path: &'a Path,
+) -> Box<dyn MemoryAgent + 'a> {
+    if let Some(mem0) = mem0 {
+        Box::new(Mem0MemoryAgent::new(mem0))
     } else {
-        "# Long-Term Memory\n\nDurable notes promoted by the runtime.\n".to_string()
-    };
-    if !contents.ends_with('\n') {
-        contents.push('\n');
+        Box::new(FileMemoryAgent::new(path))
     }
-    contents.push_str(&format!("- [{}] {}\n", iso8601ish_now(), note.trim()));
-    fs::write(path, contents)
+}
+
+fn read_long_term_memory_via_agent(
+    mem0: Option<&Mem0Config>,
+    path: &Path,
+) -> io::Result<Option<MemorySource>> {
+    let agent = long_term_memory_agent(mem0, path);
+    let snapshot = agent.read_long_term_memory()?;
+    if mem0.is_none() && !path.is_file() && snapshot.contents.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MemorySource {
+        scope: MemoryScope::Project.to_string(),
+        path: snapshot.path,
+        contents: snapshot.contents,
+        imported_from: None,
+        selector_hint: None,
+    }))
 }
 
 fn load_memory_source(
@@ -3580,21 +4096,27 @@ fn load_subagent_specs(
 fn load_skill_specs(
     root_dir: &Path,
     home_dir: Option<&Path>,
-) -> io::Result<BTreeMap<String, SkillSpec>> {
-    let mut entries = BTreeMap::new();
+    tools: &[Tool],
+    subagents: &BTreeMap<String, SubagentSpec>,
+) -> io::Result<LoadedSkills> {
+    let mut loaded = LoadedSkills::default();
     if let Some(home_dir) = home_dir {
         load_skill_dir(
             &home_dir.join(CLAUDE_DIR).join(SKILLS_DIR),
             DefinitionScope::User,
-            &mut entries,
+            &mut loaded,
+            tools,
+            subagents,
         )?;
     }
     load_skill_dir(
         &root_dir.join(CLAUDE_DIR).join(SKILLS_DIR),
         DefinitionScope::Project,
-        &mut entries,
+        &mut loaded,
+        tools,
+        subagents,
     )?;
-    Ok(entries)
+    Ok(loaded)
 }
 
 fn load_subagent_dir(
@@ -3650,7 +4172,9 @@ fn load_subagent_dir(
 fn load_skill_dir(
     dir: &Path,
     scope: DefinitionScope,
-    entries: &mut BTreeMap<String, SkillSpec>,
+    loaded: &mut LoadedSkills,
+    tools: &[Tool],
+    subagents: &BTreeMap<String, SubagentSpec>,
 ) -> io::Result<()> {
     if !dir.is_dir() {
         return Ok(());
@@ -3665,28 +4189,124 @@ fn load_skill_dir(
     for path in paths {
         let skill_file = path.join("SKILL.md");
         let contents = fs::read_to_string(&skill_file)?;
-        let (frontmatter, body) = split_frontmatter(&contents);
-        let name = frontmatter
-            .get("name")
-            .cloned()
-            .unwrap_or_else(|| file_stem_name(&path));
-        let description = frontmatter
-            .get("description")
-            .cloned()
-            .unwrap_or_else(|| "Reusable skill capability pack.".to_string());
-        entries.insert(
-            name.clone(),
-            SkillSpec {
-                name,
-                description,
-                instructions: body.trim().to_string(),
-                scope: scope.to_string(),
-                source_path: skill_file,
-            },
-        );
+        match parse_skill_spec(
+            &skill_file,
+            &contents,
+            &path,
+            scope.clone(),
+            tools,
+            subagents,
+        ) {
+            Ok(spec) => {
+                loaded.entries.insert(spec.name.clone(), spec);
+            }
+            Err(issues) => loaded.issues.extend(issues),
+        }
     }
 
     Ok(())
+}
+
+fn parse_skill_spec(
+    skill_file: &Path,
+    contents: &str,
+    skill_dir: &Path,
+    scope: DefinitionScope,
+    tools: &[Tool],
+    subagents: &BTreeMap<String, SubagentSpec>,
+) -> Result<SkillSpec, Vec<SkillValidationIssue>> {
+    let (frontmatter, body) = split_frontmatter(contents);
+    let name = frontmatter
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| file_stem_name(skill_dir));
+    let description = frontmatter
+        .get("description")
+        .cloned()
+        .unwrap_or_else(|| "Reusable skill capability pack.".to_string());
+    let version = frontmatter.get("version").cloned();
+    let tags = parse_list_field(frontmatter.get("tags").map(String::as_str)).unwrap_or_default();
+    let when_to_use = frontmatter.get("when_to_use").cloned();
+    let when_not_to_use = frontmatter.get("when_not_to_use").cloned();
+    let allowed_tools = parse_list_field(frontmatter.get("allowed_tools").map(String::as_str));
+    let preferred_subagents =
+        parse_list_field(frontmatter.get("preferred_subagents").map(String::as_str))
+            .unwrap_or_default();
+    let input_contract = frontmatter.get("input_contract").cloned();
+    let output_contract = frontmatter.get("output_contract").cloned();
+    let instructions = body.trim().to_string();
+
+    let mut issues = Vec::new();
+    if name.trim().is_empty() {
+        issues.push(skill_issue(skill_file, "Skill `name` must not be empty."));
+    }
+    if description.trim().is_empty() {
+        issues.push(skill_issue(
+            skill_file,
+            "Skill `description` must not be empty.",
+        ));
+    }
+    if instructions.is_empty() {
+        issues.push(skill_issue(skill_file, "Skill body must not be empty."));
+    }
+
+    for heading in [
+        "## Purpose",
+        "## Use When",
+        "## Do Not Use When",
+        "## Workflow",
+        "## Constraints",
+        "## Expected Outputs",
+    ] {
+        if !instructions.contains(heading) {
+            issues.push(skill_issue(
+                skill_file,
+                format!("Skill is missing required section `{heading}`."),
+            ));
+        }
+    }
+
+    if let Some(allowed_tools) = &allowed_tools {
+        for tool_name in allowed_tools {
+            if !tools.iter().any(|tool| tool.is_named(tool_name)) {
+                issues.push(skill_issue(
+                    skill_file,
+                    format!("Skill references unknown tool `{tool_name}` in `allowed_tools`."),
+                ));
+            }
+        }
+    }
+
+    for subagent_name in &preferred_subagents {
+        if !subagents.contains_key(subagent_name) {
+            issues.push(skill_issue(
+                skill_file,
+                format!(
+                    "Skill references unknown subagent `{subagent_name}` in `preferred_subagents`."
+                ),
+            ));
+        }
+    }
+
+    if !issues.is_empty() {
+        return Err(issues);
+    }
+
+    Ok(SkillSpec {
+        name,
+        description,
+        instructions,
+        version,
+        tags,
+        when_to_use,
+        when_not_to_use,
+        allowed_tools: allowed_tools.filter(|items| !items.is_empty()),
+        preferred_subagents,
+        input_contract,
+        output_contract,
+        scope: scope.to_string(),
+        source_path: skill_file.to_path_buf(),
+    })
 }
 
 fn load_custom_commands(
@@ -3781,6 +4401,32 @@ fn split_frontmatter(contents: &str) -> (BTreeMap<String, String>, String) {
 }
 
 fn parse_tools_field(value: &str) -> Option<Vec<String>> {
+    parse_list_field(Some(value)).map(|items| {
+        items
+            .into_iter()
+            .map(|item| normalize_tool_name(&item))
+            .collect()
+    })
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    match name.trim() {
+        LEGACY_WEB_SEARCH_TOOL_NAME => WEB_SEARCH_TOOL_NAME.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn file_stem_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("unnamed")
+        .to_string()
+}
+
+fn parse_list_field(value: Option<&str>) -> Option<Vec<String>> {
+    let Some(value) = value else {
+        return None;
+    };
     let normalized = value
         .trim()
         .trim_start_matches('[')
@@ -3802,11 +4448,11 @@ fn parse_tools_field(value: &str) -> Option<Vec<String>> {
     }
 }
 
-fn file_stem_name(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("unnamed")
-        .to_string()
+fn skill_issue(path: &Path, message: impl Into<String>) -> SkillValidationIssue {
+    SkillValidationIssue {
+        path: path.to_path_buf(),
+        message: message.into(),
+    }
 }
 
 fn expand_custom_command(command: &CustomCommand, arguments: &str) -> String {
@@ -4135,7 +4781,7 @@ fn copy_directory_recursive(source: &Path, destination: &Path) -> io::Result<()>
 
 fn default_skill_template(name: &str, description: &str) -> String {
     format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n# {title}\n\n## Purpose\n{description}\n\n## Workflow\n1. Start from the explicit task contract.\n2. Load only the files, tools, and observations needed for this capability.\n3. Return a concise result, artifact, or next step.\n\n## Constraints\n- Keep the working set compact.\n- Prefer deterministic execution and explicit observations.\n- Stop once the bounded skill task is complete.\n",
+        "---\nname: {name}\ndescription: {description}\nversion: 0.1.0\ntags: [workflow]\nwhen_to_use: explicit request or close match to the skill purpose\nwhen_not_to_use: when the task is better served by a tool-only answer or a different skill\nallowed_tools: []\npreferred_subagents: []\ninput_contract: task contract plus relevant files and observations\noutput_contract: concise result, artifact, or next step\n---\n\n# {title}\n\n## Purpose\n{description}\n\n## Use When\n- The user explicitly asks for this workflow.\n- The task matches the reusable capability described above.\n\n## Do Not Use When\n- A single tool call is enough.\n- Another skill or delegated subagent is a better fit.\n\n## Workflow\n1. Start from the explicit task contract.\n2. Load only the files, tools, and observations needed for this capability.\n3. Produce the smallest coherent result for the current task.\n\n## Constraints\n- Keep the working set compact.\n- Prefer deterministic execution and explicit observations.\n- Respect active tool and approval boundaries.\n\n## Expected Outputs\n- A concise result, artifact, or next step.\n\n## Examples\n- Example task: apply this skill to a bounded implementation or review task.\n",
         title = name
             .split('-')
             .map(|part| {
@@ -4245,7 +4891,34 @@ fn now_epoch_ms() -> u128 {
 }
 
 fn iso8601ish_now() -> String {
-    format!("epoch-ms:{}", now_epoch_ms())
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs() as i64;
+    let millis = duration.subsec_millis();
+    let days = total_seconds.div_euclid(86_400);
+    let seconds_of_day = total_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+
+    (year, month as u32, day as u32)
 }
 
 fn configured_env(name: &str) -> Option<String> {
@@ -4369,6 +5042,10 @@ fn scaffold_claude_project(root_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let files = vec![
         (root_dir.join(PROJECT_MEMORY_FILE), default_claude_memory()),
         (
+            root_dir.join(SYSTEM_PROMPT_DIR).join(SYSTEM_PROMPT_FILE),
+            default_system_prompt_file(),
+        ),
+        (
             root_dir
                 .join(CLAUDE_DIR)
                 .join(AGENTS_DIR)
@@ -4425,8 +5102,12 @@ fn default_claude_memory() -> &'static str {
     "# CLAUDE.md\n\nProject memory for the local harness-first runtime.\n\n## Commands\n- `cargo check`\n- `cargo test`\n- `cargo fmt`\n\n## Agent Contract\n- Start every run with an explicit task contract: goal, constraints, acceptance criteria, relevant files, and stop condition.\n- Take exactly one action per loop iteration: call a tool, use a skill, delegate to a subagent, retry, stop, or finalize.\n- Keep observations explicit between iterations instead of hiding state in prose.\n- Prefer compact context packets and explicit file references over transcript sprawl.\n\n## Memory Model\n- Short-term memory lives in `Workspace/short-term.json` and resumes recent session state.\n- Long-term memory uses Mem0 when `MEM0_API_KEY` is configured and falls back to `Workspace/MEMORY.md` otherwise.\n- Retrieved long-term memory is loaded into the planner's standing memory stack.\n- Promote durable notes with `/remember <note>` instead of hiding them in chat history.\n\n## Skills\n- Project skills live under `.claude/skills/<skill-name>/SKILL.md`.\n- User skills live under `~/.claude/skills/<skill-name>/SKILL.md`.\n- Install reusable skills before duplicating behavior in prompts or chat history.\n\n## Working Style\n- Load only the files needed for the current task.\n- Prefer deterministic harness behavior over prompt-only cleverness.\n- Use `/review` after meaningful code changes.\n"
 }
 
+fn default_system_prompt_file() -> &'static str {
+    "You are a harness-first coding agent. Start from an explicit task contract, load project memory before acting, take exactly one action per loop iteration, keep context compact, and make tools, delegation, retries, and stop conditions legible in the trace.\n"
+}
+
 fn default_explore_agent() -> &'static str {
-    "---\nname: explore\ndescription: Inspect code paths, locate files, and return a compact handoff.\ntools: [web_search]\n---\n\n# Explore Agent\n\nStart from the delegated task contract.\nNarrow the task to files, modules, constraints, and missing facts.\nReturn findings, file references, unresolved gaps, and the next practical action.\nDo not sprawl into implementation."
+    "---\nname: explore\ndescription: Inspect code paths, locate files, and return a compact handoff.\ntools: [web_search_tool]\n---\n\n# Explore Agent\n\nStart from the delegated task contract.\nNarrow the task to files, modules, constraints, and missing facts.\nReturn findings, file references, unresolved gaps, and the next practical action.\nDo not sprawl into implementation."
 }
 
 fn default_plan_agent() -> &'static str {
@@ -4500,8 +5181,15 @@ mod tests {
             short_term_memory: ShortTermMemorySnapshot::default(),
             subagents,
             skills: BTreeMap::new(),
+            skill_validation_issues: Vec::new(),
             commands: BTreeMap::new(),
         }
+    }
+
+    fn valid_skill_markdown(name: &str, description: &str) -> String {
+        format!(
+            "---\nname: {name}\ndescription: {description}\nversion: 0.1.0\ntags: [workflow]\nwhen_to_use: use this skill\nwhen_not_to_use: use another workflow\nallowed_tools: []\npreferred_subagents: []\ninput_contract: task contract\noutput_contract: concise output\n---\n\n# Skill\n\n## Purpose\n{description}\n\n## Use When\n- Use it intentionally.\n\n## Do Not Use When\n- Another skill is a better fit.\n\n## Workflow\n1. Read the task contract.\n2. Execute the bounded workflow.\n\n## Constraints\n- Keep the result concise.\n\n## Expected Outputs\n- A concrete result.\n\n## Examples\n- Example usage.\n"
+        )
     }
 
     #[test]
@@ -4524,6 +5212,23 @@ mod tests {
             root.join("Workspace/short-term.json")
         );
         assert_eq!(paths.long_term_notes, root.join("Workspace/MEMORY.md"));
+    }
+
+    #[test]
+    fn scaffold_claude_project_creates_system_prompt_file() {
+        let root = temp_root("scaffold-system-prompt");
+
+        let created = scaffold_claude_project(&root).expect("project scaffold should succeed");
+
+        assert!(
+            created.contains(&root.join("system_prompt/system_prompt.md")),
+            "expected scaffold to create a system prompt file"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("system_prompt/system_prompt.md"))
+                .expect("system prompt file should be readable"),
+            default_system_prompt_file()
+        );
     }
 
     #[test]
@@ -4584,7 +5289,10 @@ mod tests {
 
         assert_eq!(
             normalized,
-            vec![PathBuf::from("src/main.rs"), PathBuf::from("docs/architecture.md")]
+            vec![
+                PathBuf::from("src/main.rs"),
+                PathBuf::from("docs/architecture.md")
+            ]
         );
     }
 
@@ -4758,12 +5466,12 @@ mod tests {
             agent.preview_planner_decision("search the web for the latest rust release", &[]);
 
         assert_eq!(decision.action, "tool");
-        assert_eq!(decision.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(decision.tool_name.as_deref(), Some("web_search_tool"));
         assert_eq!(decision.planner_backend, "local heuristic planner");
         assert!(decision
             .reasoning
             .iter()
-            .any(|item| item.contains("web_search")));
+            .any(|item| item.contains("web_search_tool")));
     }
 
     #[test]
@@ -4799,7 +5507,7 @@ mod tests {
 
         let decision = agent.preview_planner_decision(
             "retry the search",
-            &["Recoverable tool failure from `web_search`: timeout".to_string()],
+            &["Recoverable tool failure from `web_search_tool`: timeout".to_string()],
         );
 
         assert_eq!(decision.action, "retry");
@@ -4936,22 +5644,46 @@ mod tests {
         fs::create_dir_all(&project_dir).expect("project dir");
         fs::write(
             user_dir.join("SKILL.md"),
-            "---\nname: developer\ndescription: User skill\n---\nUser",
+            valid_skill_markdown("developer", "User skill"),
         )
         .expect("user skill");
         fs::write(
             project_dir.join("SKILL.md"),
-            "---\nname: developer\ndescription: Project skill\n---\nProject",
+            valid_skill_markdown("developer", "Project skill"),
         )
         .expect("project skill");
 
-        let skills = load_skill_specs(&root, Some(&home)).expect("skills should load");
+        let skills = load_skill_specs(&root, Some(&home), &default_tools(), &BTreeMap::new())
+            .expect("skills should load");
         let developer = skills
+            .entries
             .get("developer")
             .expect("developer skill should exist");
 
         assert_eq!(developer.description, "Project skill");
         assert_eq!(developer.scope, "project");
+    }
+
+    #[test]
+    fn invalid_skill_files_are_reported_and_skipped() {
+        let root = temp_root("skill-invalid");
+        let skill_dir = root.join(".claude").join("skills").join("broken");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: broken\ndescription: Broken skill\n---\nNo required sections",
+        )
+        .expect("skill file");
+
+        let loaded = load_skill_specs(&root, None, &default_tools(), &BTreeMap::new())
+            .expect("skills should load");
+
+        assert!(loaded.entries.is_empty());
+        assert!(!loaded.issues.is_empty());
+        assert!(loaded
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("missing required section")));
     }
 
     #[test]
@@ -4981,7 +5713,7 @@ mod tests {
         fs::create_dir_all(source_dir.join("references")).expect("references dir");
         fs::write(
             source_dir.join("SKILL.md"),
-            "---\nname: developer\ndescription: Developer workflow\n---\nBody",
+            valid_skill_markdown("developer", "Developer workflow"),
         )
         .expect("skill file");
         fs::write(source_dir.join("references").join("guide.md"), "guide").expect("guide file");
@@ -5054,14 +5786,126 @@ mod tests {
     }
 
     #[test]
-    fn infer_tool_request_routes_web_queries_to_web_search() {
+    fn context_history_appends_entries_to_history_file() {
+        let root = temp_root("context-history");
+        let path = context_history_path(&root);
+        let mut state = SessionState::default();
+        state
+            .history
+            .push(ConversationMessage::user("previous question"));
+
+        let first = capture_context_history_entry(
+            "OpenAI Responses API",
+            "gpt-5.4",
+            "system prompt",
+            "planner prompt",
+            &state,
+            "current question",
+            &json!({
+                "model": "gpt-5.4",
+                "input": [{"role": "user", "content": "current question"}]
+            }),
+        );
+        let second = capture_context_history_entry(
+            "Anthropic Messages API",
+            "Opus 4.6",
+            "fallback system prompt",
+            "fallback planner prompt",
+            &state,
+            "retry question",
+            &json!({
+                "model": "Opus 4.6",
+                "messages": [{"role": "user", "content": "retry question"}]
+            }),
+        );
+
+        persist_context_history(&path, &first).expect("first context entry should persist");
+        persist_context_history(&path, &second).expect("second context entry should persist");
+
+        let contents = fs::read_to_string(&path).expect("history file should exist");
+        let entries: Vec<ContextHistoryEntry> =
+            serde_json::from_str(&contents).expect("history file should parse");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].provider, "OpenAI Responses API");
+        assert_eq!(
+            entries[0].actual_context.current_user_input,
+            "current question"
+        );
+        assert_eq!(entries[1].model, "Opus 4.6");
+        assert_eq!(
+            entries[1].final_context.request_body["messages"][0]["content"],
+            "retry question"
+        );
+        assert!(entries[0].datetime.contains('T'));
+        assert!(entries[0].datetime.ends_with('Z'));
+    }
+
+    #[test]
+    fn rendered_context_preview_shows_actual_and_final_context_sections() {
+        let root = temp_root("context-preview");
+        let path = context_history_path(&root);
+        let mut state = SessionState::default();
+        state
+            .history
+            .push(ConversationMessage::assistant("previous answer"));
+
+        let entry = capture_context_history_entry(
+            "OpenAI Responses API",
+            "gpt-5.4",
+            "system prompt",
+            "planner prompt",
+            &state,
+            "current prompt",
+            &json!({
+                "model": "gpt-5.4",
+                "input": [{"role": "user", "content": "current prompt"}]
+            }),
+        );
+
+        let preview = render_context_preview(&entry, &path);
+
+        assert!(preview.contains("LLM context preview"));
+        assert!(preview.contains("Actual context:"));
+        assert!(preview.contains("Final request JSON:"));
+        assert!(preview.contains("system prompt"));
+        assert!(preview.contains("planner prompt"));
+        assert!(preview.contains("current prompt"));
+        assert!(preview.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn infer_tool_request_routes_web_queries_to_web_search_tool() {
         let inferred =
             infer_tool_request("Find the latest OpenAI API docs updates", &default_tools())
                 .expect("web search should be inferred");
 
-        assert_eq!(inferred.0, "web_search");
+        assert_eq!(inferred.0, "web_search_tool");
         assert_eq!(inferred.1, Value::Object(Default::default()));
-        assert!(inferred.2.contains("Planner inferred `web_search`"));
+        assert!(inferred.2.contains("Planner inferred `web_search_tool`"));
+    }
+
+    #[test]
+    fn infer_tool_request_normalizes_legacy_web_search_name() {
+        let inferred = infer_tool_request(
+            r#"Use tool web_search with {"query":"latest Rust release notes"}"#,
+            &default_tools(),
+        )
+        .expect("legacy tool request should be inferred");
+
+        assert_eq!(inferred.0, "web_search_tool");
+        assert_eq!(inferred.1["query"], "latest Rust release notes");
+        assert!(inferred.2.contains("normalized to `web_search_tool`"));
+    }
+
+    #[test]
+    fn parse_tools_field_normalizes_legacy_web_search_name() {
+        let tools = parse_tools_field("[web_search, other_tool]").expect("tools should parse");
+
+        assert_eq!(
+            tools,
+            vec!["web_search_tool".to_string(), "other_tool".to_string()]
+        );
     }
 
     #[test]
@@ -5073,6 +5917,14 @@ mod tests {
                 name: "developer".to_string(),
                 description: "Developer workflow".to_string(),
                 instructions: "Do the work".to_string(),
+                version: None,
+                tags: Vec::new(),
+                when_to_use: None,
+                when_not_to_use: None,
+                allowed_tools: None,
+                preferred_subagents: Vec::new(),
+                input_contract: None,
+                output_contract: None,
                 scope: "project".to_string(),
                 source_path: PathBuf::from(".claude/skills/developer/SKILL.md"),
             },
@@ -5086,7 +5938,101 @@ mod tests {
     }
 
     #[test]
-    fn web_queries_use_web_search_path_without_explicit_tool_wrapper() {
+    fn planner_prompt_expands_only_the_active_skill_instructions() {
+        let mut skills = BTreeMap::new();
+        skills.insert(
+            "developer".to_string(),
+            SkillSpec {
+                name: "developer".to_string(),
+                description: "Developer workflow".to_string(),
+                instructions: "## Purpose\nDo the work".to_string(),
+                version: Some("0.1.0".to_string()),
+                tags: vec!["workflow".to_string()],
+                when_to_use: Some("when implementing".to_string()),
+                when_not_to_use: Some("when browsing".to_string()),
+                allowed_tools: Some(vec!["web_search_tool".to_string()]),
+                preferred_subagents: vec!["general-purpose".to_string()],
+                input_contract: Some("task contract".to_string()),
+                output_contract: Some("concise result".to_string()),
+                scope: "project".to_string(),
+                source_path: PathBuf::from(".claude/skills/developer/SKILL.md"),
+            },
+        );
+        let mut subagents = BTreeMap::new();
+        subagents.insert(
+            "general-purpose".to_string(),
+            SubagentSpec {
+                name: "general-purpose".to_string(),
+                description: "General".to_string(),
+                prompt: "Prompt".to_string(),
+                tool_allowlist: None,
+                scope: "project".to_string(),
+                source_path: PathBuf::from(".claude/agents/general-purpose.md"),
+            },
+        );
+        let mut state = SessionState::default();
+        state.active_skill = Some(ActiveSkill {
+            name: "developer".to_string(),
+            source_path: PathBuf::from(".claude/skills/developer/SKILL.md"),
+            activated_by: "planner".to_string(),
+            task_fit: "implement the task".to_string(),
+            allowed_tools: Some(vec!["web_search_tool".to_string()]),
+            preferred_subagents: vec!["general-purpose".to_string()],
+        });
+
+        let prompt = planner_prompt(
+            &state,
+            "",
+            &default_tools(),
+            &subagents,
+            &skills,
+            state.active_skill.as_ref(),
+            &TaskContract {
+                goal: "Resolve task".to_string(),
+                constraints: vec!["stay bounded".to_string()],
+                acceptance_criteria: vec!["return next action".to_string()],
+                relevant_files: vec![],
+                stop_condition: "finish when done".to_string(),
+            },
+            &[],
+            0,
+        );
+
+        assert!(prompt.contains("Available skills:"));
+        assert!(prompt.contains("- developer: Developer workflow"));
+        assert!(prompt.contains("Active skill:"));
+        assert!(prompt.contains("implement the task"));
+        assert!(prompt.contains("## Purpose"));
+    }
+
+    #[test]
+    fn active_skill_allowed_tools_are_enforced() {
+        let root = temp_root("skill-tool-enforcement");
+        let agent = test_agent(root);
+        let mut state = SessionState::default();
+        state.active_skill = Some(ActiveSkill {
+            name: "ship-small".to_string(),
+            source_path: PathBuf::from(".claude/skills/ship-small/SKILL.md"),
+            activated_by: "user".to_string(),
+            task_fit: "search the web".to_string(),
+            allowed_tools: Some(vec!["nonexistent".to_string()]),
+            preferred_subagents: Vec::new(),
+        });
+
+        let result = agent.run_with_state(
+            &mut state,
+            "Search the web for the latest Rust release notes",
+        );
+
+        assert!(result.stopped);
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("does not allow tool `web_search_tool`")));
+    }
+
+    #[test]
+    fn web_queries_use_web_search_tool_path_without_explicit_tool_wrapper() {
         let root = temp_root("web-search-routing");
         let agent = test_agent(root);
 
@@ -5096,7 +6042,7 @@ mod tests {
         assert!(result
             .trace
             .iter()
-            .any(|entry| entry.contains("Planner inferred `web_search`")));
+            .any(|entry| entry.contains("Planner inferred `web_search_tool`")));
         assert!(result
             .trace
             .iter()

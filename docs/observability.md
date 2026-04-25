@@ -10,6 +10,7 @@ This scaffold can export runtime traces to both LangSmith and Langfuse through O
 - `tool.*` spans for tool execution
 - runtime log lines as span events when a traced span is active
 - final-output metadata on the active span
+- terminal-visible planner context previews before model calls, with append-only JSON snapshots in `history/context_history.json`
 
 ## LangSmith Setup
 

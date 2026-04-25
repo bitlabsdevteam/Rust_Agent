@@ -2,7 +2,7 @@
   "name": "retry continues after a recoverable observation",
   "user_input": "retry the web lookup",
   "observations": [
-    "Recoverable tool failure from `web_search`: timeout"
+    "Recoverable tool failure from `web_search_tool`: timeout"
   ],
   "expected": {
     "action": "retry"

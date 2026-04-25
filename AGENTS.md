@@ -227,7 +227,7 @@ The current Rust scaffold implements:
 - project and user subagent discovery from `.claude/agents/*.md`
 - project and user slash-command discovery from `.claude/commands/*.md`
 - isolated subagent delegation with compact context packets and structured handoffs
-- MCP tool loading plus grounded `web_search` support
+- MCP tool loading plus grounded `web_search_tool` support
 - execution trace output and OpenTelemetry-based observability for session, tool, and subagent behavior
 
 ## Near-Term Production Upgrades

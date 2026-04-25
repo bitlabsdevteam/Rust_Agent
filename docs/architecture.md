@@ -4,7 +4,7 @@
 
 This repository is a CLI-first Rust starter for harness-first agent systems. The core design goal is to keep the implementation small while making the operational subsystems legible: planner routing, memory loading, compaction, tools, skills, subagents, retries, stop conditions, and trace output.
 
-The current architecture centers on `MainAgent` in `src/mainAgent.rs`. The CLI in `src/main.rs` is a thin entrypoint that parses commands, resolves the system prompt, and hands control to the runtime.
+The current architecture centers on `MainAgent` in `src/mainAgent.rs`. The CLI in `src/main.rs` is a thin entrypoint that parses commands, resolves the system prompt from `system_prompt/` or explicit overrides, and hands control to the runtime.
 
 ## Top-Level Structure
 
@@ -25,7 +25,56 @@ src/mcp.rs
 
 src/observability.rs
   -> OpenTelemetry setup and trace/event helpers
+
+src/dispatch.rs
+  -> delegated-work request/response contracts
+  -> local dispatcher seam between worker ownership and subagent execution
+
+src/prompt_layers.rs
+  -> explicit planner prompt-layer structures
+  -> builder for system, memory, task, skills, observations, and channel metadata
+
+src/scheduler.rs
+  -> scheduled-event contracts
+  -> local explicit-invocation scheduler skeleton
+
+src/concurrency.rs
+  -> worker lease and admission-control contracts
+  -> local single-process concurrency gate
 ```
+
+## Emerging Control-Plane Seams
+
+The repository is in transition toward the sprint v2 control plane. Several seams now exist even though the overall runtime is still centered on `MainAgent`.
+
+- `src/bus.rs` defines event envelopes plus the local in-process bus skeleton.
+- `src/channels/` adapts CLI input into inbound events instead of treating the terminal path as the whole runtime.
+- `src/channels/` also defines outbound channel-worker delivery contracts, with a local CLI delivery worker.
+- `src/worker.rs` wraps the current agent loop behind a worker-facing request/result contract.
+- `src/router.rs` makes event ownership explicit before worker execution.
+- `src/dispatch.rs` defines delegated-work contracts so sub-work can cross a dispatch boundary instead of being treated as an implicit direct call.
+- `src/prompt_layers.rs` separates prompt assembly into explicit layers instead of building planner context as one opaque string.
+- `src/scheduler.rs` defines scheduled events and a local scheduler that produces no background work unless a caller explicitly enqueues an event.
+- `src/concurrency.rs` defines worker leases and a local concurrency gate so admission control can wrap worker execution before distributed scheduling exists.
+
+These seams are intentionally small. The current implementation still executes local synthesized subagent behavior, but dispatch is now represented as a dedicated contract that later tasks can route through richer worker ownership and scheduling paths.
+
+## Control Plane Skeleton
+
+The current control-plane path is local and single-process:
+
+```text
+CLI invocation
+  -> CliChannel
+  -> InProcessBus
+  -> DefaultRouter
+  -> MainAgentWorker
+  -> MainAgent loop
+  -> WorkerResult / OutboundEvent
+  -> ChannelWorker delivery seam
+```
+
+Scheduled work and concurrency are represented as contracts rather than background automation. `LocalScheduler` only emits events that were explicitly enqueued by the caller, and `LocalConcurrencyGate` provides conservative worker-slot leases for future worker admission wrappers.
 
 ## Runtime Flow
 
@@ -83,18 +132,19 @@ Planner order:
 2. Anthropic fallback planner if configured
 3. local heuristic router if model-backed planning fails or is unavailable
 
-Both model-backed planners receive:
+Both model-backed planners receive explicit prompt layers for:
 
-- system prompt
-- merged project memory
+- system instructions
+- project memory
 - visible tools
 - visible subagents
-- visible skills
+- skill context
 - task contract
 - recent observations
+- channel metadata
 - compacted and recent history summary
 
-The planner prompt is assembled in `planner_prompt()`. It explicitly instructs the model to choose one action and return strict JSON. This keeps decision-making inspectable and bounded rather than embedding hidden behavior in free-form responses.
+The planner prompt is assembled in `planner_prompt()` through `src/prompt_layers.rs`. It still instructs the model to choose one action and return strict JSON, but the input is now organized as explicit sections rather than one hand-built formatter block. This keeps decision-making inspectable and bounded while making later prompt evolution easier to test.
 
 ## Memory Surfaces
 
@@ -153,7 +203,14 @@ Tools are loaded from:
 
 ### Skills
 
-Skills are loaded from project and user `.claude/skills/` directories. `apply_skill()` treats a skill as a reusable capability pack that returns its instructions and task fit as an observation.
+Skills are loaded from project and user `.claude/skills/` directories. Each skill is a file-backed capability pack with metadata, workflow guidance, and optional tool/subagent preferences.
+
+The runtime keeps two separate skill surfaces:
+
+- visible skill catalog for planner selection
+- one active skill for the current session step
+
+`apply_skill()` activates a skill in session state instead of treating the skill body as a terminal answer. The next planner iteration receives the active skill instructions in a dedicated prompt layer. If the active skill declares `allowed_tools`, the harness narrows the visible tool set and enforces that allowlist at tool-execution time.
 
 ### Subagents
 
@@ -224,10 +281,11 @@ These are the main places to evolve the harness without turning the whole runtim
 
 The current architecture is intentionally narrow:
 
-- CLI-first only
-- no event bus
+- CLI-first execution path
 - no remote API/server surface
-- no dedicated eval runner yet
+- no distributed queue or durable event log
+- scheduler exists as an explicit local seam, not a background cron engine
+- concurrency exists as a local worker-admission seam, not distributed locking
 - no path-scoped memory precedence yet
 - subagent execution is still local synthesized behavior rather than a deeper agent runtime
 
