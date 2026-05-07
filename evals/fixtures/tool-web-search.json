@@ -1,9 +1,13 @@
 {
   "name": "tool routing uses web_search_tool for explicit web queries",
-  "user_input": "search the web for the latest Rust release notes",
+  "user_input": "use tool web_search with {\"query\":\"latest Rust release notes\"}",
   "observations": [],
   "expected": {
     "action": "tool",
-    "tool_name": "web_search_tool"
+    "tool_name": "web_search_tool",
+    "tool_arguments_json": {
+      "query": "latest Rust release notes"
+    },
+    "reason_contains": "Explicit tool request detected"
   }
 }

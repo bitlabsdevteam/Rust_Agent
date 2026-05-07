@@ -54,6 +54,48 @@ Priority rule:
 - repo-local files remain the source of truth for this repository's code, behavior, and constraints
 - the vault is the required reference for general AI agent building guidance and reusable design patterns
 
+### OpenClaw Architecture Sequence
+
+When the task is to build, extend, or review an advanced personal AI assistant agent, explicitly refer to this local OpenClaw architecture path before choosing implementation order:
+
+- `/Users/davidbong/Documents/ModernSoftwareDeveloperProject/Agent_In_Rust/OpenClaw_architecture`
+
+Use the local `OpenClaw_architecture` directory as the primary step-order reference for implementation sequence. Use the external vault as supporting design context when broader agent patterns or rationale are needed:
+
+- `/Users/davidbong/Documents/my_second_brain_vault/wiki/analyses/building-openclaw-style-agents.md`
+- `/Users/davidbong/Documents/my_second_brain_vault/wiki/entities/openclaw.md`
+- `/Users/davidbong/Documents/my_second_brain_vault/wiki/source-notes/build-your-own-openclaw-step-clippings-source-note.md`
+- `/Users/davidbong/Documents/my_second_brain_vault/raw/sources/2026-04-20-build-your-own-openclaw-github.md`
+
+Treat this sequence as a dependency order, not as a loose checklist:
+
+1. `00-chat-loop`
+2. `01-tools`
+3. `02-skills`
+4. `03-persistence`
+5. `04-slash-commands`
+6. `05-compaction`
+7. `06-web-tools`
+8. `07-event-driven`
+9. `08-config-hot-reload`
+10. `09-channels`
+11. `10-websocket`
+12. `11-multi-agent-routing`
+13. `12-cron-heartbeat`
+14. `13-multi-layer-prompts`
+15. `14-post-message-back`
+16. `15-agent-dispatch`
+17. `16-concurrency-control`
+18. `17-memory`
+
+Execution rule:
+
+- do not mark a step complete until its implementation, validation, and acceptance criteria are fully complete
+- do not move to the next numbered step just because code exists; the current step must be working end-to-end
+- for example, `00-chat-loop` must not be marked complete and work must not advance to `01-tools` until `00-chat-loop` is fully completed and verified
+- if a later step reveals a gap in an earlier step, return to the earlier step, fix it, and only then continue the sequence
+- only break this sequence when a repo-local document explicitly requires a different order for this repository
+
 ## Production Standard
 
 ### 1. Context Engineering Standard

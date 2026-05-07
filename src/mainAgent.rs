@@ -1,7 +1,10 @@
-use crate::dispatch::{DispatchRequest, DispatchResponse, Dispatcher, LocalDispatcher};
+use crate::dispatch::{DispatchRequest, DispatchResponse, Dispatcher, LocalDispatcher, ProcessDispatcher};
 use crate::evals::PlannerEvalActualDecision;
 use crate::mcp::{load_mcp_catalog_from_env, McpServerSummary};
 use crate::memory_agent::{FileMemoryAgent, MemoryAgent, MemoryAgentSnapshot};
+use crate::planner::{Decision, PlannerFailureKind, PlannerRouter, PlannerRun as PlannerRunGeneric};
+#[cfg(test)]
+use crate::planner::{classify_planner_failure_kind, planner_failure_run};
 use crate::observability::{self, Observability};
 use crate::prompt_layers::{
     ActiveSkillLayer, ChannelMetadataLayer, ObservationLayer, PlannerPromptLayers,
@@ -16,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -115,6 +118,7 @@ struct AgentConfig {
     fallback_model: &'static str,
     planner_backend: String,
     max_retries: u8,
+    allow_heuristic_planner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,7 +248,7 @@ pub struct MemoryStack {
     pub load_request: MemoryLoadRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPacket {
     pub goal: String,
     pub constraints: Vec<String>,
@@ -576,7 +580,7 @@ struct LoadedSkills {
     issues: Vec<SkillValidationIssue>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsageRecord {
     pub actor: String,
     pub input_tokens: u32,
@@ -623,6 +627,14 @@ impl TokenUsageRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegationOutcome {
+    response: DispatchResponse,
+    launch_mode: &'static str,
+}
+
+type PlannerRun = PlannerRunGeneric<TokenUsageRecord>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CustomCommand {
     name: String,
     description: String,
@@ -643,56 +655,6 @@ pub struct SkillInstallRequest {
     pub source: String,
     pub skill_name: Option<String>,
     pub scope: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Decision {
-    CallTool {
-        tool_name: String,
-        arguments: Value,
-        reason: String,
-    },
-    UseSkill {
-        skill_name: String,
-        reason: String,
-    },
-    DelegateSubagent {
-        subagent_name: String,
-        reason: String,
-    },
-    Finish {
-        answer: String,
-        reason: String,
-    },
-    Retry(String),
-    Stop(String),
-}
-
-impl fmt::Display for Decision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CallTool {
-                tool_name, reason, ..
-            } => write!(f, "call tool `{tool_name}` ({reason})"),
-            Self::UseSkill { skill_name, reason } => {
-                write!(f, "use skill `{skill_name}` ({reason})")
-            }
-            Self::DelegateSubagent {
-                subagent_name,
-                reason,
-            } => write!(f, "delegate to subagent `{subagent_name}` ({reason})"),
-            Self::Finish { answer, reason } => write!(f, "finish ({reason}; {answer})"),
-            Self::Retry(reason) => write!(f, "retry ({reason})"),
-            Self::Stop(reason) => write!(f, "stop ({reason})"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PlannerRun {
-    decision: Decision,
-    reasoning: Vec<String>,
-    usage: Option<TokenUsageRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,17 +710,13 @@ impl MainAgent {
 
         let planner_backend = match (&llm_engine, &fallback_engine) {
             (Some(primary), Some(fallback)) => format!(
-                "OpenAI Responses planner ({}) -> Anthropic planner ({}) -> local heuristic router",
+                "OpenAI Responses planner ({}) -> Anthropic planner ({})",
                 primary.model, fallback.model
             ),
-            (Some(primary), None) => format!(
-                "OpenAI Responses planner ({}) -> local heuristic router",
-                primary.model
-            ),
-            (None, Some(fallback)) => format!(
-                "Anthropic planner ({}) -> local heuristic router",
-                fallback.model
-            ),
+            (Some(primary), None) => {
+                format!("OpenAI Responses planner ({})", primary.model)
+            }
+            (None, Some(fallback)) => format!("Anthropic planner ({})", fallback.model),
             (None, None) => "local heuristic planner".to_string(),
         };
 
@@ -776,6 +734,7 @@ impl MainAgent {
                 fallback_model: FALLBACK_MODEL,
                 planner_backend,
                 max_retries: MAX_RETRIES,
+                allow_heuristic_planner: llm_engine.is_none() && fallback_engine.is_none(),
             },
             llm_engine,
             fallback_engine,
@@ -835,6 +794,7 @@ impl MainAgent {
             return PlannerEvalActualDecision {
                 action: "stop".to_string(),
                 tool_name: None,
+                tool_arguments_json: None,
                 skill_name: None,
                 subagent_name: None,
                 reason: "user input was empty".to_string(),
@@ -843,6 +803,7 @@ impl MainAgent {
                     "The eval preview applies the harness stop condition before planner routing."
                         .to_string(),
                 ],
+                failure_class: None,
             };
         }
         if let Some(observation) = observations.last() {
@@ -852,6 +813,7 @@ impl MainAgent {
                 return PlannerEvalActualDecision {
                     action: "retry".to_string(),
                     tool_name: None,
+                    tool_arguments_json: None,
                     skill_name: None,
                     subagent_name: None,
                     reason: "the latest observation still reflects a recoverable failure"
@@ -861,12 +823,14 @@ impl MainAgent {
                         "The eval preview preserves harness retry semantics from the latest observation."
                             .to_string(),
                     ],
+                    failure_class: Some(PlannerFailureKind::Recoverable.label().to_string()),
                 };
             }
 
             return PlannerEvalActualDecision {
                 action: "finish".to_string(),
                 tool_name: None,
+                tool_arguments_json: None,
                 skill_name: None,
                 subagent_name: None,
                 reason: "the latest observation is now the best available answer".to_string(),
@@ -875,12 +839,27 @@ impl MainAgent {
                     "The eval preview finishes when the latest observation already answers the task."
                         .to_string(),
                 ],
+                failure_class: None,
             };
         }
         let state = SessionState::default();
-        let task_contract = self.build_task_contract(input, observations);
-        let run = self.decide_next_step(&state, input, &task_contract, observations, 0);
-        planner_eval_actual_decision(run, &self.config.planner_backend)
+        let run = heuristic_plan(
+            input,
+            &self.tools,
+            &self.subagents,
+            &self.skills,
+            state.active_skill.as_ref(),
+            observations,
+        );
+        let planner_backend = if self.config.planner_backend == "local heuristic planner" {
+            self.config.planner_backend.clone()
+        } else {
+            format!(
+                "local heuristic eval preview (configured: {})",
+                self.config.planner_backend
+            )
+        };
+        planner_eval_actual_decision(run, &planner_backend)
     }
 
     fn refresh_project_state(&mut self) -> io::Result<()> {
@@ -1127,9 +1106,18 @@ impl MainAgent {
                         "Iteration {step_count}: planner decision = {}",
                         planner_run.decision
                     ));
+                    trace.extend(planner_run.trace.iter().map(|item| {
+                        format!("Iteration {step_count}: {item}")
+                    }));
                     trace.extend(planner_run.reasoning.iter().map(|item| {
                         format!("Iteration {step_count}: planner reasoning = {item}")
                     }));
+                    if let Some(failure_kind) = planner_run.failure_kind {
+                        trace.push(format!(
+                            "Iteration {step_count}: planner failure class = {}.",
+                            failure_kind.label()
+                        ));
+                    }
                     if let Some(record) = planner_run.usage {
                         usage.push(record);
                     } else if !usage.iter().any(|record| record.actor == "main agent request") {
@@ -1281,17 +1269,71 @@ impl MainAgent {
                                 "Iteration {step_count}: delegating to subagent `{subagent_name}` because {reason}"
                             ));
                             match self.delegate_to_subagent(&subagent_name, state, input) {
-                                Ok(result) => {
-                                    usage.extend(result.usage.clone());
+                                Ok(outcome) => {
+                                    observability::record_subagent_dispatch_event(
+                                        "result",
+                                        outcome.response.dispatch_id.as_str(),
+                                        &subagent_name,
+                                        outcome.launch_mode,
+                                        None,
+                                    );
+                                    crate::runtime_log::info(
+                                        "subagent",
+                                        format!(
+                                            "dispatch_id={} subagent={} launch_mode={} status=result summary={}",
+                                            outcome.response.dispatch_id.as_str(),
+                                            subagent_name,
+                                            outcome.launch_mode,
+                                            observability::compact_text(
+                                                &outcome.response.summary,
+                                                200
+                                            )
+                                        ),
+                                    );
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent launch mode = `{}`.",
+                                        outcome.launch_mode
+                                    ));
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent dispatch_id = `{}`.",
+                                        outcome.response.dispatch_id.as_str()
+                                    ));
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent responder = {}.",
+                                        outcome.response.responder
+                                    ));
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent result summary = {}",
+                                        outcome.response.summary
+                                    ));
+                                    trace.push(format!(
+                                        "Iteration {step_count}: subagent recommended next action = {}",
+                                        outcome.response.recommended_next_action
+                                    ));
+                                    usage.extend(outcome.response.usage.clone());
                                     observations.push(format!(
                                         "Subagent `{subagent_name}` observation:\n{}",
-                                        result.render()
+                                        outcome.response.render()
                                     ));
                                     trace.push(format!(
                                         "Iteration {step_count}: subagent observation recorded."
                                     ));
                                 }
                                 Err(reason) => {
+                                    observability::record_subagent_dispatch_event(
+                                        "failure",
+                                        "unknown",
+                                        &subagent_name,
+                                        "unknown",
+                                        Some(reason.clone()),
+                                    );
+                                    crate::runtime_log::warn(
+                                        "subagent",
+                                        format!(
+                                            "subagent={} status=failure error={}",
+                                            subagent_name, reason
+                                        ),
+                                    );
                                     retry_count += 1;
                                     let observation =
                                         format!("Recoverable delegation failure: {reason}");
@@ -1416,127 +1458,76 @@ impl MainAgent {
         observations: &[String],
         retry_count: u8,
     ) -> PlannerRun {
-        if let Some(engine) = &self.llm_engine {
-            match engine.plan(
-                &self.root_dir,
-                &self.config,
-                &self.memory_stack.merged_instructions,
-                &self.tools,
-                &self.subagents,
-                &self.skills,
-                state.active_skill.as_ref(),
-                state,
-                input,
-                task_contract,
-                observations,
-                retry_count,
-            ) {
-                Ok(plan) => return plan,
-                Err(reason) => {
-                    if let Some(engine) = &self.fallback_engine {
-                        match engine.plan(
-                            &self.root_dir,
-                            &self.config,
-                            &self.memory_stack.merged_instructions,
-                            &self.tools,
-                            &self.subagents,
-                            &self.skills,
-                            state.active_skill.as_ref(),
-                            state,
-                            input,
-                            task_contract,
-                            observations,
-                            retry_count,
-                        ) {
-                            Ok(mut plan) => {
-                                plan.reasoning.push(format!(
-                                    "Primary planner failed and the harness fell back to `{}`: {}",
-                                    self.config.fallback_model, reason
-                                ));
-                                return plan;
-                            }
-                            Err(fallback_reason) => {
-                                let mut fallback = heuristic_plan(
-                                    input,
-                                    &self.tools,
-                                    &self.subagents,
-                                    &self.skills,
-                                    state.active_skill.as_ref(),
-                                    observations,
-                                );
-                                fallback
-                                    .reasoning
-                                    .push(format!("OpenAI planner failed: {reason}"));
-                                fallback.reasoning.push(format!(
-                                    "Fallback planner `{}` failed: {}",
-                                    self.config.fallback_model, fallback_reason
-                                ));
-                                fallback.reasoning.push(
-                                    "The harness fell back to the local heuristic router."
-                                        .to_string(),
-                                );
-                                return fallback;
-                            }
-                        }
-                    }
+        let router = PlannerRouter::new(
+            self.config.planner_backend.clone(),
+            self.config.default_model,
+            self.config.fallback_model,
+            self.config.allow_heuristic_planner,
+        );
 
-                    let mut fallback = heuristic_plan(
+        router.decide(
+            self.llm_engine.as_ref().map(|engine| {
+                let root_dir = &self.root_dir;
+                let config = &self.config;
+                let memory_context = &self.memory_stack.merged_instructions;
+                let tools = &self.tools;
+                let subagents = &self.subagents;
+                let skills = &self.skills;
+                let active_skill = state.active_skill.as_ref();
+                let state = state;
+                move || {
+                    engine.plan(
+                        root_dir,
+                        config,
+                        memory_context,
+                        tools,
+                        subagents,
+                        skills,
+                        active_skill,
+                        state,
                         input,
-                        &self.tools,
-                        &self.subagents,
-                        &self.skills,
-                        state.active_skill.as_ref(),
+                        task_contract,
                         observations,
-                    );
-                    fallback.reasoning.push(format!(
-                        "OpenAI planner failed; fell back to the local heuristic router: {reason}"
-                    ));
-                    return fallback;
+                        retry_count,
+                    )
                 }
-            }
-        }
-
-        if let Some(engine) = &self.fallback_engine {
-            match engine.plan(
-                &self.root_dir,
-                &self.config,
-                &self.memory_stack.merged_instructions,
-                &self.tools,
-                &self.subagents,
-                &self.skills,
-                state.active_skill.as_ref(),
-                state,
-                input,
-                task_contract,
-                observations,
-                retry_count,
-            ) {
-                Ok(plan) => return plan,
-                Err(reason) => {
-                    let mut fallback = heuristic_plan(
+            }),
+            self.fallback_engine.as_ref().map(|engine| {
+                let root_dir = &self.root_dir;
+                let config = &self.config;
+                let memory_context = &self.memory_stack.merged_instructions;
+                let tools = &self.tools;
+                let subagents = &self.subagents;
+                let skills = &self.skills;
+                let active_skill = state.active_skill.as_ref();
+                let state = state;
+                move || {
+                    engine.plan(
+                        root_dir,
+                        config,
+                        memory_context,
+                        tools,
+                        subagents,
+                        skills,
+                        active_skill,
+                        state,
                         input,
-                        &self.tools,
-                        &self.subagents,
-                        &self.skills,
-                        state.active_skill.as_ref(),
+                        task_contract,
                         observations,
-                    );
-                    fallback.reasoning.push(format!(
-                        "Fallback planner `{}` failed; fell back to the local heuristic router: {reason}",
-                        self.config.fallback_model
-                    ));
-                    return fallback;
+                        retry_count,
+                    )
                 }
-            }
-        }
-
-        heuristic_plan(
-            input,
-            &self.tools,
-            &self.subagents,
-            &self.skills,
-            state.active_skill.as_ref(),
-            observations,
+            }),
+            || {
+                heuristic_plan(
+                    input,
+                    &self.tools,
+                    &self.subagents,
+                    &self.skills,
+                    state.active_skill.as_ref(),
+                    observations,
+                )
+            },
         )
     }
 
@@ -1699,7 +1690,7 @@ impl MainAgent {
         subagent_name: &str,
         state: &SessionState,
         task: &str,
-    ) -> Result<DispatchResponse, String> {
+    ) -> Result<DelegationOutcome, String> {
         let spec = self
             .subagents
             .get(subagent_name)
@@ -1744,15 +1735,74 @@ impl MainAgent {
             file_refs,
             observations,
         );
-        let dispatcher = LocalDispatcher::new(|request| Ok(execute_subagent(spec, request)));
-        self.observability.with_span(
-            format!("subagent.{}", spec.name),
-            vec![
-                KeyValue::new("subagent.name", spec.name.clone()),
-                KeyValue::new("subagent.scope", spec.scope.clone()),
-            ],
-            || dispatcher.dispatch(request.clone()),
-        )
+        let dispatch_id = request.dispatch_id.as_str().to_string();
+        match ProcessDispatcher::from_current_exe(self.root_dir.clone(), Duration::from_secs(30))
+        {
+            Ok(dispatcher) => {
+                observability::record_subagent_dispatch_event(
+                    "launch",
+                    &dispatch_id,
+                    &spec.name,
+                    "spawned-process",
+                    None,
+                );
+                crate::runtime_log::info(
+                    "subagent",
+                    format!(
+                        "dispatch_id={} subagent={} launch_mode=spawned-process status=launch",
+                        dispatch_id, spec.name
+                    ),
+                );
+                self.observability
+                    .with_span(
+                        format!("subagent.{}", spec.name),
+                        vec![
+                            KeyValue::new("subagent.name", spec.name.clone()),
+                            KeyValue::new("subagent.scope", spec.scope.clone()),
+                            KeyValue::new("subagent.launch_mode", "spawned-process"),
+                            KeyValue::new("subagent.dispatch_id", dispatch_id.clone()),
+                        ],
+                        || dispatcher.dispatch(request),
+                    )
+                    .map(|response| DelegationOutcome {
+                        response,
+                        launch_mode: "spawned-process",
+                    })
+            }
+            Err(error) => {
+                observability::record_subagent_dispatch_event(
+                    "launch",
+                    &dispatch_id,
+                    &spec.name,
+                    "local-fallback",
+                    Some(error.to_string()),
+                );
+                crate::runtime_log::warn(
+                    "subagent",
+                    format!(
+                        "dispatch_id={} subagent={} launch_mode=local-fallback status=launch error={}",
+                        dispatch_id, spec.name, error
+                    ),
+                );
+                let dispatcher = LocalDispatcher::new(|request| Ok(execute_subagent(spec, request)));
+                self.observability
+                    .with_span(
+                        format!("subagent.{}", spec.name),
+                        vec![
+                            KeyValue::new("subagent.name", spec.name.clone()),
+                            KeyValue::new("subagent.scope", spec.scope.clone()),
+                            KeyValue::new("subagent.launch_mode", "local-fallback"),
+                            KeyValue::new("subagent.launch_error", error.to_string()),
+                            KeyValue::new("subagent.dispatch_id", dispatch_id.clone()),
+                        ],
+                        || dispatcher.dispatch(request),
+                    )
+                    .map(|response| DelegationOutcome {
+                        response,
+                        launch_mode: "local-fallback",
+                    })
+            }
+        }
     }
 
     fn build_context_packet(&self, task: &str, state: &SessionState) -> ContextPacket {
@@ -1948,7 +1998,7 @@ impl MainAgent {
             }
             SlashCommand::Agent { name, task } => {
                 match self.delegate_to_subagent(&name, state, &task) {
-                    Ok(result) => Ok(CommandOutcome::Continue(result.render())),
+                    Ok(result) => Ok(CommandOutcome::Continue(result.response.render())),
                     Err(reason) => Ok(CommandOutcome::Continue(reason)),
                 }
             }
@@ -2538,6 +2588,27 @@ fn infer_subagent_name<'a>(
     subagents.keys().next().cloned()
 }
 
+fn parse_explicit_subagent_request(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let prefix = "use agent ";
+    if !lower.starts_with(prefix) {
+        return None;
+    }
+
+    let remainder = trimmed[prefix.len()..].trim();
+    let name = remainder
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn heuristic_plan(
     input: &str,
     tools: &[Tool],
@@ -2550,53 +2621,68 @@ fn heuristic_plan(
         if observation.starts_with("Recoverable ")
             || observation.starts_with("Planner retry request:")
         {
-            return PlannerRun {
-                decision: Decision::Retry(
+            return PlannerRun::failure(
+                Decision::Retry(
                     "the latest observation still reflects a recoverable failure".to_string(),
                 ),
-                reasoning: vec![
+                vec![
                     "The heuristic router preserves retry semantics when the latest observation is a recoverable failure."
                         .to_string(),
                 ],
-                usage: None,
-            };
+                PlannerFailureKind::Recoverable,
+            );
         }
 
-        return PlannerRun {
-            decision: Decision::Finish {
+        return PlannerRun::success(
+            Decision::Finish {
                 answer: observation.clone(),
                 reason: "the latest observation is now the best available answer".to_string(),
             },
-            reasoning: vec![
+            vec![
                 "The heuristic router finishes after a successful observation instead of taking another action."
                     .to_string(),
             ],
-            usage: None,
-        };
+            None,
+        );
     }
 
     if let Some((tool_name, arguments, route_reason)) = infer_tool_request(input, tools) {
-        return PlannerRun {
-            decision: Decision::CallTool {
+        return PlannerRun::success(
+            Decision::CallTool {
                 tool_name,
                 arguments,
                 reason: route_reason.clone(),
             },
-            reasoning: vec![route_reason],
-            usage: None,
-        };
+            vec![route_reason],
+            None,
+        );
+    }
+
+    if let Some(subagent_name) = parse_explicit_subagent_request(input) {
+        if subagents.contains_key(&subagent_name) {
+            return PlannerRun::success(
+                Decision::DelegateSubagent {
+                    subagent_name: subagent_name.clone(),
+                    reason: format!("Explicit subagent request detected for `{subagent_name}`."),
+                },
+                vec![format!(
+                    "The local heuristic router honored the explicit subagent request for `{subagent_name}`."
+                )],
+                None,
+            );
+        }
     }
 
     if active_skill.is_none() {
         if let Some((skill_name, route_reason)) = infer_skill_request(input, skills) {
-            return PlannerRun {
-                decision: Decision::UseSkill {
+            return PlannerRun::success(
+                Decision::UseSkill {
                     skill_name,
                     reason: route_reason.clone(),
                 },
-                reasoning: vec![route_reason],
-                usage: None,
-            };
+                vec![route_reason],
+                None,
+            );
         }
     }
 
@@ -2607,61 +2693,75 @@ fn heuristic_plan(
             .find(|name| subagents.contains_key(*name))
             .cloned()
         {
-            return PlannerRun {
-                decision: Decision::DelegateSubagent {
+            return PlannerRun::success(
+                Decision::DelegateSubagent {
                     subagent_name,
                     reason: format!(
                         "Active skill `{}` prefers delegated execution through that subagent.",
                         active_skill.name
                     ),
                 },
-                reasoning: vec![format!(
+                vec![format!(
                     "The local heuristic router deferred to the active skill `{}`.",
                     active_skill.name
                 )],
-                usage: None,
-            };
+                None,
+            );
         }
     }
 
     let subagent_name =
         infer_subagent_name(input, subagents).unwrap_or_else(|| "general-purpose".to_string());
-    PlannerRun {
-        decision: Decision::DelegateSubagent {
+    PlannerRun::success(
+        Decision::DelegateSubagent {
             subagent_name,
             reason: "No explicit tool request was inferred.".to_string(),
         },
-        reasoning: vec![
+        vec![
             "No model-backed planner succeeded; using the local heuristic router.".to_string(),
         ],
-        usage: None,
-    }
+        None,
+    )
 }
 
 fn planner_eval_actual_decision(
     run: PlannerRun,
     planner_backend: &str,
 ) -> PlannerEvalActualDecision {
-    match run.decision {
+    let PlannerRun {
+        decision,
+        reasoning,
+        trace: _,
+        usage: _,
+        failure_kind,
+    } = run;
+    let failure_class = failure_kind.map(|kind| kind.label().to_string());
+    match decision {
         Decision::CallTool {
-            tool_name, reason, ..
+            tool_name,
+            arguments,
+            reason,
         } => PlannerEvalActualDecision {
             action: "tool".to_string(),
             tool_name: Some(tool_name),
             skill_name: None,
             subagent_name: None,
+            tool_arguments_json: Some(arguments),
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
         Decision::UseSkill { skill_name, reason } => PlannerEvalActualDecision {
             action: "skill".to_string(),
             tool_name: None,
             skill_name: Some(skill_name),
             subagent_name: None,
+            tool_arguments_json: None,
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
         Decision::DelegateSubagent {
             subagent_name,
@@ -2671,36 +2771,44 @@ fn planner_eval_actual_decision(
             tool_name: None,
             skill_name: None,
             subagent_name: Some(subagent_name),
+            tool_arguments_json: None,
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
         Decision::Finish { reason, .. } => PlannerEvalActualDecision {
             action: "finish".to_string(),
             tool_name: None,
             skill_name: None,
             subagent_name: None,
+            tool_arguments_json: None,
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
         Decision::Retry(reason) => PlannerEvalActualDecision {
             action: "retry".to_string(),
             tool_name: None,
             skill_name: None,
             subagent_name: None,
+            tool_arguments_json: None,
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
         Decision::Stop(reason) => PlannerEvalActualDecision {
             action: "stop".to_string(),
             tool_name: None,
             skill_name: None,
             subagent_name: None,
+            tool_arguments_json: None,
             reason,
             planner_backend: planner_backend.to_string(),
-            reasoning: run.reasoning,
+            reasoning,
+            failure_class,
         },
     }
 }
@@ -2802,14 +2910,14 @@ impl OpenAiEngine {
         let decision = planner_payload_to_decision(&payload, tools, subagents, skills)?;
         let reasoning = vec![reasoning_summary_for_decision(&decision)];
 
-        Ok(PlannerRun {
+        Ok(PlannerRun::success(
             decision,
             reasoning,
-            usage: response
+            response
                 .usage
                 .as_ref()
                 .map(|usage| usage.as_token_record(&self.model)),
-        })
+        ))
     }
 
     fn send_json_request(&self, request: Value) -> Result<OpenAiResponse, String> {
@@ -2946,14 +3054,14 @@ impl AnthropicEngine {
         let decision = planner_payload_to_decision(&payload, tools, subagents, skills)?;
         let reasoning = vec![reasoning_summary_for_decision(&decision)];
 
-        Ok(PlannerRun {
+        Ok(PlannerRun::success(
             decision,
             reasoning,
-            usage: response
+            response
                 .usage
                 .as_ref()
                 .map(|usage| usage.as_token_record(&self.model)),
-        })
+        ))
     }
 
     fn send_json_request(&self, request: Value) -> Result<AnthropicResponse, String> {
@@ -3560,6 +3668,49 @@ fn execute_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchRe
         "plan" => execute_plan_subagent(spec, request),
         _ => execute_general_subagent(spec, request),
     }
+}
+
+pub fn run_spawned_subagent_child() -> io::Result<()> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    let request: DispatchRequest = serde_json::from_str(&input).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid child dispatch request JSON: {error}"),
+        )
+    })?;
+    let root_dir = env::current_dir()?;
+    let response = execute_spawned_subagent_request_in_root(&root_dir, request)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let payload = serde_json::to_string(&response).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to serialize child dispatch response: {error}"),
+        )
+    })?;
+    println!("{payload}");
+    Ok(())
+}
+
+fn execute_spawned_subagent_request_in_root(
+    root_dir: &Path,
+    request: DispatchRequest,
+) -> Result<DispatchResponse, String> {
+    let target_name = match &request.target {
+        crate::dispatch::DispatchTarget::Subagent { name } => name.clone(),
+        crate::dispatch::DispatchTarget::Worker { profile } => {
+            return Err(format!(
+                "child subagent runtime does not support worker target `{profile}`"
+            ))
+        }
+    };
+
+    let subagents = load_subagent_specs(&root_dir, None)
+        .map_err(|error| format!("failed to load subagent specs: {error}"))?;
+    let spec = subagents
+        .get(&target_name)
+        .ok_or_else(|| format!("Unknown subagent `{target_name}`."))?;
+    Ok(execute_subagent(spec, request))
 }
 
 fn execute_explore_subagent(spec: &SubagentSpec, request: DispatchRequest) -> DispatchResponse {
@@ -5133,6 +5284,7 @@ fn default_long_term_memory() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::EventId;
     use crate::Tools::default_tools;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -5171,6 +5323,7 @@ mod tests {
                 fallback_model: FALLBACK_MODEL,
                 planner_backend: "local heuristic planner".to_string(),
                 max_retries: MAX_RETRIES,
+                allow_heuristic_planner: true,
             },
             llm_engine: None,
             fallback_engine: None,
@@ -5184,6 +5337,70 @@ mod tests {
             skill_validation_issues: Vec::new(),
             commands: BTreeMap::new(),
         }
+    }
+
+    fn planner_test_agent(
+        root_dir: PathBuf,
+        llm_engine: Option<OpenAiEngine>,
+        fallback_engine: Option<AnthropicEngine>,
+        allow_heuristic_planner: bool,
+    ) -> MainAgent {
+        let mut agent = test_agent(root_dir);
+        agent.llm_engine = llm_engine;
+        agent.fallback_engine = fallback_engine;
+        agent.config.planner_backend = match (&agent.llm_engine, &agent.fallback_engine) {
+            (Some(primary), Some(fallback)) => format!(
+                "OpenAI Responses planner ({}) -> Anthropic planner ({})",
+                primary.model, fallback.model
+            ),
+            (Some(primary), None) => format!("OpenAI Responses planner ({})", primary.model),
+            (None, Some(fallback)) => format!("Anthropic planner ({})", fallback.model),
+            (None, None) => "local heuristic planner".to_string(),
+        };
+        agent.config.allow_heuristic_planner = allow_heuristic_planner;
+        agent
+    }
+
+    fn openai_test_response(payload: &str) -> String {
+        format!(
+            r#"{{
+                "id": "resp_test",
+                "status": "completed",
+                "output": [
+                    {{
+                        "type": "message",
+                        "content": [
+                            {{
+                                "type": "output_text",
+                                "text": {payload:?}
+                            }}
+                        ]
+                    }}
+                ],
+                "usage": {{
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "total_tokens": 18
+                }}
+            }}"#
+        )
+    }
+
+    fn anthropic_test_response(payload: &str) -> String {
+        format!(
+            r#"{{
+                "content": [
+                    {{
+                        "type": "text",
+                        "text": {payload:?}
+                    }}
+                ],
+                "usage": {{
+                    "input_tokens": 13,
+                    "output_tokens": 5
+                }}
+            }}"#
+        )
     }
 
     fn valid_skill_markdown(name: &str, description: &str) -> String {
@@ -5462,16 +5679,72 @@ mod tests {
         let root = temp_root("planner-eval-tool");
         let agent = test_agent(root);
 
-        let decision =
-            agent.preview_planner_decision("search the web for the latest rust release", &[]);
+        let decision = agent.preview_planner_decision(
+            r#"use tool web_search with {"query":"latest Rust release notes"}"#,
+            &[],
+        );
 
         assert_eq!(decision.action, "tool");
         assert_eq!(decision.tool_name.as_deref(), Some("web_search_tool"));
+        assert_eq!(
+            decision.tool_arguments_json,
+            Some(serde_json::json!({
+                "query": "latest Rust release notes"
+            }))
+        );
         assert_eq!(decision.planner_backend, "local heuristic planner");
         assert!(decision
             .reasoning
             .iter()
             .any(|item| item.contains("web_search_tool")));
+    }
+
+    #[test]
+    fn planner_eval_preview_uses_local_heuristic_path_even_when_model_planners_are_configured() {
+        let root = temp_root("planner-eval-configured");
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            Some(AnthropicEngine {
+                api_key: "anthropic-test-key".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                model: FALLBACK_MODEL.to_string(),
+                version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            }),
+            false,
+        );
+
+        let decision = agent.preview_planner_decision(
+            r#"use tool web_search with {"query":"latest Rust release notes"}"#,
+            &[],
+        );
+
+        assert_eq!(decision.action, "tool");
+        assert_eq!(decision.tool_name.as_deref(), Some("web_search_tool"));
+        assert!(decision
+            .planner_backend
+            .starts_with("local heuristic eval preview"));
+    }
+
+    #[test]
+    fn planner_eval_preview_prefers_explicit_subagent_request_over_skill_inference() {
+        let agent = MainAgent::from_env(DEFAULT_SYSTEM_PROMPT.to_string())
+            .expect("agent should load for explicit subagent preview");
+
+        let decision = agent.preview_planner_decision(
+            "use agent plan to outline the implementation for a new eval runner",
+            &[],
+        );
+
+        assert_eq!(decision.action, "delegate");
+        assert_eq!(decision.subagent_name.as_deref(), Some("plan"));
+        assert!(decision
+            .reason
+            .contains("Explicit subagent request detected"));
     }
 
     #[test]
@@ -5515,6 +5788,356 @@ mod tests {
             decision.reason,
             "the latest observation still reflects a recoverable failure"
         );
+        assert_eq!(
+            decision.failure_class.as_deref(),
+            Some(PlannerFailureKind::Recoverable.label())
+        );
+    }
+
+    #[test]
+    fn planner_failure_classifier_distinguishes_transient_and_terminal_errors() {
+        assert_eq!(
+            classify_planner_failure_kind("HTTP 503 Service Unavailable"),
+            PlannerFailureKind::Recoverable
+        );
+        assert_eq!(
+            classify_planner_failure_kind("Planner JSON parse failed: missing action"),
+            PlannerFailureKind::Terminal
+        );
+
+        let retry_run: PlannerRun = planner_failure_run(
+            "OpenAI Responses API",
+            "HTTP 503 Service Unavailable".to_string(),
+            PlannerFailureKind::Recoverable,
+            None,
+        );
+        assert!(matches!(retry_run.decision, Decision::Retry(_)));
+        assert_eq!(retry_run.failure_kind, Some(PlannerFailureKind::Recoverable));
+
+        let stop_run: PlannerRun = planner_failure_run(
+            "OpenAI Responses API",
+            "Planner JSON parse failed: missing action".to_string(),
+            PlannerFailureKind::Terminal,
+            None,
+        );
+        assert!(matches!(stop_run.decision, Decision::Stop(_)));
+        assert_eq!(stop_run.failure_kind, Some(PlannerFailureKind::Terminal));
+    }
+
+    #[test]
+    fn decide_next_step_uses_primary_planner_when_openai_succeeds() {
+        let root = temp_root("planner-primary-success");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let planner_payload =
+            r#"{"action":"finish","tool_name":"","tool_arguments_json":"{}","skill_name":"","subagent_name":"","answer":"primary answer","reason":"primary planner answered directly"}"#;
+        let (base_url, handle) = spawn_http_test_server(
+            requests.clone(),
+            vec![("200 OK", openai_test_response(planner_payload))],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            None,
+            false,
+        );
+        let state = SessionState::default();
+        let task_contract = agent.build_task_contract("Answer directly", &[]);
+
+        let run = agent.decide_next_step(&state, "Answer directly", &task_contract, &[], 0);
+
+        handle.join().expect("server thread should finish");
+        assert!(matches!(
+            run.decision,
+            Decision::Finish {
+                answer,
+                reason
+            } if answer == "primary answer" && reason == "primary planner answered directly"
+        ));
+        assert!(run.failure_kind.is_none());
+        let usage = run.usage.expect("primary planner should report usage");
+        assert_eq!(usage.execution, "OpenAI Responses API (gpt-5.4)");
+        let request_log = requests.lock().expect("request log should lock");
+        assert_eq!(request_log.len(), 1);
+        assert!(request_log[0].contains("POST / HTTP/1.1"));
+        assert!(request_log[0].contains("openai-test-key"));
+    }
+
+    #[test]
+    fn decide_next_step_falls_back_to_anthropic_after_primary_failure() {
+        let root = temp_root("planner-fallback-success");
+        let openai_requests = Arc::new(Mutex::new(Vec::new()));
+        let anthropic_requests = Arc::new(Mutex::new(Vec::new()));
+        let fallback_payload =
+            r#"{"action":"finish","tool_name":"","tool_arguments_json":"{}","skill_name":"","subagent_name":"","answer":"fallback answer","reason":"fallback planner answered directly"}"#;
+        let (openai_base_url, openai_handle) = spawn_http_test_server(
+            openai_requests.clone(),
+            vec![("503 Service Unavailable", r#"{"error":"planner unavailable"}"#.to_string())],
+        );
+        let (anthropic_base_url, anthropic_handle) = spawn_http_test_server(
+            anthropic_requests.clone(),
+            vec![("200 OK", anthropic_test_response(fallback_payload))],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url: openai_base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            Some(AnthropicEngine {
+                api_key: "anthropic-test-key".to_string(),
+                base_url: anthropic_base_url,
+                model: FALLBACK_MODEL.to_string(),
+                version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            }),
+            false,
+        );
+        let state = SessionState::default();
+        let task_contract = agent.build_task_contract("Answer with fallback", &[]);
+
+        let run = agent.decide_next_step(&state, "Answer with fallback", &task_contract, &[], 0);
+
+        openai_handle.join().expect("openai server thread should finish");
+        anthropic_handle
+            .join()
+            .expect("anthropic server thread should finish");
+        assert!(matches!(
+            run.decision,
+            Decision::Finish {
+                answer,
+                reason
+            } if answer == "fallback answer" && reason == "fallback planner answered directly"
+        ));
+        assert!(run.failure_kind.is_none());
+        assert!(run
+            .reasoning
+            .iter()
+            .any(|entry| entry.contains("Primary planner failed and the harness fell back")));
+        let usage = run.usage.expect("fallback planner should report usage");
+        assert_eq!(usage.execution, "Anthropic Messages API (Opus 4.6)");
+        let openai_request_log = openai_requests.lock().expect("openai request log should lock");
+        let anthropic_request_log = anthropic_requests
+            .lock()
+            .expect("anthropic request log should lock");
+        assert_eq!(openai_request_log.len(), 1);
+        assert_eq!(anthropic_request_log.len(), 1);
+        assert!(anthropic_request_log[0].contains("x-api-key: anthropic-test-key"));
+    }
+
+    #[test]
+    fn decide_next_step_classifies_dual_planner_failure_without_heuristic_fallback() {
+        let root = temp_root("planner-dual-failure");
+        let openai_requests = Arc::new(Mutex::new(Vec::new()));
+        let anthropic_requests = Arc::new(Mutex::new(Vec::new()));
+        let (openai_base_url, openai_handle) = spawn_http_test_server(
+            openai_requests.clone(),
+            vec![("503 Service Unavailable", r#"{"error":"planner unavailable"}"#.to_string())],
+        );
+        let (anthropic_base_url, anthropic_handle) = spawn_http_test_server(
+            anthropic_requests.clone(),
+            vec![("500 Internal Server Error", r#"{"error":"fallback unavailable"}"#.to_string())],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url: openai_base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            Some(AnthropicEngine {
+                api_key: "anthropic-test-key".to_string(),
+                base_url: anthropic_base_url,
+                model: FALLBACK_MODEL.to_string(),
+                version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            }),
+            false,
+        );
+        let state = SessionState::default();
+        let task_contract = agent.build_task_contract("Handle planner failure", &[]);
+
+        let run = agent.decide_next_step(&state, "Handle planner failure", &task_contract, &[], 0);
+
+        openai_handle.join().expect("openai server thread should finish");
+        anthropic_handle
+            .join()
+            .expect("anthropic server thread should finish");
+        assert_eq!(run.failure_kind, Some(PlannerFailureKind::Recoverable));
+        assert!(matches!(run.decision, Decision::Retry(_)));
+        assert!(run
+            .reasoning
+            .iter()
+            .any(|entry| entry.contains("fallback planner failed")));
+        let openai_request_log = openai_requests.lock().expect("openai request log should lock");
+        let anthropic_request_log = anthropic_requests
+            .lock()
+            .expect("anthropic request log should lock");
+        assert_eq!(openai_request_log.len(), 1);
+        assert_eq!(anthropic_request_log.len(), 1);
+    }
+
+    #[test]
+    fn run_trace_records_primary_planner_backend_and_decision() {
+        let root = temp_root("planner-trace-primary-success");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let planner_payload =
+            r#"{"action":"finish","tool_name":"","tool_arguments_json":"{}","skill_name":"","subagent_name":"","answer":"primary answer","reason":"primary planner answered directly"}"#;
+        let (base_url, handle) = spawn_http_test_server(
+            requests,
+            vec![("200 OK", openai_test_response(planner_payload))],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            None,
+            false,
+        );
+        let mut state = SessionState::default();
+
+        let result = agent.run_with_state(&mut state, "Answer directly");
+
+        handle.join().expect("server thread should finish");
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner attempt = primary backend `OpenAI GPT-5.4`; outcome = success; failure class = none."
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner fallback outcome = not available; no configured fallback planner."
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("planner decision = finish (primary planner answered directly; primary answer)")));
+    }
+
+    #[test]
+    fn run_trace_records_fallback_success_after_primary_failure() {
+        let root = temp_root("planner-trace-fallback-success");
+        let openai_requests = Arc::new(Mutex::new(Vec::new()));
+        let anthropic_requests = Arc::new(Mutex::new(Vec::new()));
+        let fallback_payload =
+            r#"{"action":"finish","tool_name":"","tool_arguments_json":"{}","skill_name":"","subagent_name":"","answer":"fallback answer","reason":"fallback planner answered directly"}"#;
+        let (openai_base_url, openai_handle) = spawn_http_test_server(
+            openai_requests,
+            vec![("503 Service Unavailable", r#"{"error":"planner unavailable"}"#.to_string())],
+        );
+        let (anthropic_base_url, anthropic_handle) = spawn_http_test_server(
+            anthropic_requests,
+            vec![("200 OK", anthropic_test_response(fallback_payload))],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url: openai_base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            Some(AnthropicEngine {
+                api_key: "anthropic-test-key".to_string(),
+                base_url: anthropic_base_url,
+                model: FALLBACK_MODEL.to_string(),
+                version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            }),
+            false,
+        );
+        let mut state = SessionState::default();
+
+        let result = agent.run_with_state(&mut state, "Answer with fallback");
+
+        openai_handle.join().expect("openai server thread should finish");
+        anthropic_handle
+            .join()
+            .expect("anthropic server thread should finish");
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner attempt = primary backend `OpenAI GPT-5.4`; outcome = failure; failure class = recoverable;"
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner attempt = fallback backend `Opus 4.6`; outcome = success; failure class = none."
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner fallback outcome = configured fallback planner succeeded after primary failure."
+            )));
+    }
+
+    #[test]
+    fn run_trace_records_fallback_failure_and_overall_failure_class() {
+        let root = temp_root("planner-trace-dual-failure");
+        let openai_requests = Arc::new(Mutex::new(Vec::new()));
+        let anthropic_requests = Arc::new(Mutex::new(Vec::new()));
+        let (openai_base_url, openai_handle) = spawn_http_test_server(
+            openai_requests,
+            vec![("503 Service Unavailable", r#"{"error":"planner unavailable"}"#.to_string())],
+        );
+        let (anthropic_base_url, anthropic_handle) = spawn_http_test_server(
+            anthropic_requests,
+            vec![("500 Internal Server Error", r#"{"error":"fallback unavailable"}"#.to_string())],
+        );
+        let agent = planner_test_agent(
+            root,
+            Some(OpenAiEngine {
+                api_key: "openai-test-key".to_string(),
+                base_url: openai_base_url,
+                model: DEFAULT_OPENAI_MODEL.to_string(),
+            }),
+            Some(AnthropicEngine {
+                api_key: "anthropic-test-key".to_string(),
+                base_url: anthropic_base_url,
+                model: FALLBACK_MODEL.to_string(),
+                version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            }),
+            false,
+        );
+        let mut state = SessionState::default();
+
+        let result = agent.run_with_state(&mut state, "Handle planner failure");
+
+        openai_handle.join().expect("openai server thread should finish");
+        anthropic_handle
+            .join()
+            .expect("anthropic server thread should finish");
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner attempt = primary backend `OpenAI GPT-5.4`; outcome = failure; failure class = recoverable;"
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner attempt = fallback backend `Opus 4.6`; outcome = failure; failure class = terminal;"
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "planner fallback outcome = configured fallback planner failed after primary failure."
+            )));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("planner failure class = recoverable.")));
     }
 
     fn test_mem0_config(base_url: &str, root_dir: &Path) -> Mem0Config {
@@ -5632,6 +6255,113 @@ mod tests {
 
         assert_eq!(plan.description, "Project planner");
         assert_eq!(plan.scope, "project");
+    }
+
+    #[test]
+    fn spawned_subagent_request_uses_loaded_subagent_spec() {
+        let root = temp_root("spawned-subagent");
+        let agent_dir = root.join(".claude").join("agents");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        fs::write(
+            agent_dir.join("plan.md"),
+            "---\nname: plan\ndescription: Project planner\n---\nPlan body",
+        )
+        .expect("project agent");
+
+        let request = DispatchRequest::for_subagent(
+            "main-worker",
+            "plan",
+            "Produce a plan",
+            ContextPacket {
+                goal: "Produce a plan".to_string(),
+                constraints: vec!["Keep it small".to_string()],
+                relevant_files: vec!["src/mainAgent.rs".to_string()],
+                known_facts: vec!["Main agent exists".to_string()],
+                missing_facts: vec!["Need a child execution path".to_string()],
+                next_action: "Return the delegated result".to_string(),
+                stop_condition: "Stop after the delegated result".to_string(),
+            },
+            vec!["Workspace/MEMORY.md".to_string()],
+            vec!["src/mainAgent.rs".to_string()],
+            vec!["user: inspect child spawn".to_string()],
+        );
+
+        let response = execute_spawned_subagent_request_in_root(&root, request)
+            .expect("spawned subagent should execute");
+
+        assert_eq!(response.responder, "subagent plan");
+        assert!(response.summary.contains("compact execution plan"));
+        assert!(response.final_text.contains("Plan agent"));
+        assert!(response.final_text.contains("Task: Produce a plan"));
+        assert!(response.dispatch_id.as_str().starts_with("evt-"));
+    }
+
+    #[test]
+    fn spawned_subagent_request_rejects_unknown_subagent() {
+        let root = temp_root("spawned-subagent-unknown");
+        let agent_dir = root.join(".claude").join("agents");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        fs::write(
+            agent_dir.join("plan.md"),
+            "---\nname: plan\ndescription: Project planner\n---\nPlan body",
+        )
+        .expect("project agent");
+
+        let request = DispatchRequest::for_subagent(
+            "main-worker",
+            "missing",
+            "Produce a plan",
+            ContextPacket {
+                goal: "Produce a plan".to_string(),
+                constraints: vec!["Keep it small".to_string()],
+                relevant_files: vec!["src/mainAgent.rs".to_string()],
+                known_facts: vec!["Main agent exists".to_string()],
+                missing_facts: vec!["Need a child execution path".to_string()],
+                next_action: "Return the delegated result".to_string(),
+                stop_condition: "Stop after the delegated result".to_string(),
+            },
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let error = execute_spawned_subagent_request_in_root(&root, request)
+            .expect_err("unknown subagents should be rejected");
+
+        assert_eq!(error, "Unknown subagent `missing`.");
+    }
+
+    #[test]
+    fn spawned_subagent_request_rejects_worker_targets() {
+        let root = temp_root("spawned-subagent-worker");
+        let request = DispatchRequest {
+            dispatch_id: EventId::new("evt-fixed"),
+            requester: "main-worker".to_string(),
+            target: crate::dispatch::DispatchTarget::Worker {
+                profile: "planner".to_string(),
+            },
+            task: "Produce a plan".to_string(),
+            context_packet: ContextPacket {
+                goal: "Produce a plan".to_string(),
+                constraints: vec!["Keep it small".to_string()],
+                relevant_files: vec!["src/mainAgent.rs".to_string()],
+                known_facts: vec!["Main agent exists".to_string()],
+                missing_facts: vec!["Need a child execution path".to_string()],
+                next_action: "Return the delegated result".to_string(),
+                stop_condition: "Stop after the delegated result".to_string(),
+            },
+            memory_refs: vec![],
+            file_refs: vec![],
+            observations: vec![],
+        };
+
+        let error = execute_spawned_subagent_request_in_root(&root, request)
+            .expect_err("worker targets should be rejected");
+
+        assert_eq!(
+            error,
+            "child subagent runtime does not support worker target `planner`"
+        );
     }
 
     #[test]
@@ -5761,7 +6491,9 @@ mod tests {
 
         assert!(summary.contains("Token usage"));
         assert!(summary.contains("main agent request: 0 input, 0 output, 0 total"));
-        assert!(summary.contains("subagent `general-purpose`: 0 input, 0 output, 0 total"));
+        assert!(summary.contains(
+            "subagent `general-purpose`: 0 input, 0 output, 0 total [local synthesized subagent; no model API call]"
+        ));
         assert!(result
             .trace
             .iter()
@@ -5770,6 +6502,37 @@ mod tests {
             .trace
             .iter()
             .any(|entry| entry.contains("Token usage: subagent `general-purpose`")));
+    }
+
+    #[test]
+    fn run_trace_records_subagent_correlation_and_result_details() {
+        let root = temp_root("subagent-trace-correlation");
+        let agent = test_agent(root);
+
+        let result = agent.run("Inspect the task and suggest next steps");
+
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("delegating to subagent `general-purpose` because")));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("subagent launch mode = `local-fallback`")));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("subagent dispatch_id = `evt-")));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains("subagent result summary = general-purpose returned a compact handoff.")));
+        assert!(result
+            .trace
+            .iter()
+            .any(|entry| entry.contains(
+                "subagent recommended next action = Refine the task, delegate to `/agent plan ...`, or call an explicit tool if needed."
+            )));
     }
 
     #[test]

@@ -15,7 +15,7 @@ src/main.rs
 
 src/mainAgent.rs
   -> runtime loop
-  -> planner integration and heuristic fallback
+  -> planner integration and failure classification
   -> memory loading and compaction
   -> slash command handling
   -> tool / skill / subagent execution
@@ -28,7 +28,7 @@ src/observability.rs
 
 src/dispatch.rs
   -> delegated-work request/response contracts
-  -> local dispatcher seam between worker ownership and subagent execution
+  -> process dispatcher seam between worker ownership and spawned subagent execution
 
 src/prompt_layers.rs
   -> explicit planner prompt-layer structures
@@ -57,7 +57,7 @@ The repository is in transition toward the sprint v2 control plane. Several seam
 - `src/scheduler.rs` defines scheduled events and a local scheduler that produces no background work unless a caller explicitly enqueues an event.
 - `src/concurrency.rs` defines worker leases and a local concurrency gate so admission control can wrap worker execution before distributed scheduling exists.
 
-These seams are intentionally small. The current implementation still executes local synthesized subagent behavior, but dispatch is now represented as a dedicated contract that later tasks can route through richer worker ownership and scheduling paths.
+These seams are intentionally small. The current implementation still keeps the child subagent logic lightweight, but dispatch now crosses a real process boundary so later tasks can route through richer worker ownership and scheduling paths.
 
 ## Control Plane Skeleton
 
@@ -130,7 +130,7 @@ Planner order:
 
 1. OpenAI planner if configured
 2. Anthropic fallback planner if configured
-3. local heuristic router if model-backed planning fails or is unavailable
+3. local heuristic router only when no model-backed planner is configured
 
 Both model-backed planners receive explicit prompt layers for:
 
@@ -144,7 +144,7 @@ Both model-backed planners receive explicit prompt layers for:
 - channel metadata
 - compacted and recent history summary
 
-The planner prompt is assembled in `planner_prompt()` through `src/prompt_layers.rs`. It still instructs the model to choose one action and return strict JSON, but the input is now organized as explicit sections rather than one hand-built formatter block. This keeps decision-making inspectable and bounded while making later prompt evolution easier to test.
+The planner prompt is assembled in `planner_prompt()` through `src/prompt_layers.rs`. It still instructs the model to choose one action and return strict JSON, but the input is now organized as explicit sections rather than one hand-built formatter block. If the model-backed planner fails, the runtime now classifies that failure as recoverable or terminal instead of silently dropping to the heuristic router, which keeps stop and retry behavior explicit.
 
 ## Memory Surfaces
 
@@ -224,7 +224,23 @@ Subagents are loaded from project and user `.claude/agents/*.md`. `delegate_to_s
 - next action
 - stop condition
 
-The current implementation executes local synthesized subagent behaviors for `explore`, `plan`, and general-purpose handoffs.
+The current implementation launches the child subagent as a separate process, passes the compact context packet over stdin, and reads the structured response back from stdout. The child process still uses the repo's lightweight `explore`, `plan`, and general-purpose handlers, but the execution boundary is now explicit.
+
+### Delegation Boundary
+
+Current synthesized delegation:
+
+- the older local path delegated directly to an in-process synthesized subagent handler
+- the parent and child shared one runtime boundary
+- delegation results came back as a local callback rather than a spawned process result
+
+Spawned child execution:
+
+- `ProcessDispatcher` in `src/dispatch.rs` launches the same binary as a child worker
+- the hidden `__spawn-subagent` command in `src/main.rs` switches the binary into child-subagent mode
+- the parent writes a serialized `DispatchRequest` to stdin and reads a structured `DispatchResponse` from stdout
+- the parent trace now records launch reason, launch mode, dispatch ID, responder, summary, and recommended next action
+- unit tests still use a local fallback when child spawning is disabled, but that is now a test/runtime guardrail rather than the primary delegation path
 
 ### Slash Commands
 
@@ -287,6 +303,7 @@ The current architecture is intentionally narrow:
 - scheduler exists as an explicit local seam, not a background cron engine
 - concurrency exists as a local worker-admission seam, not distributed locking
 - no path-scoped memory precedence yet
-- subagent execution is still local synthesized behavior rather than a deeper agent runtime
+- child subagents are process-spawned locally, not distributed or persistent workers
+- local synthesized delegation still exists only as a fallback path when child spawning is unavailable
 
 That is acceptable for v1. The next meaningful step is not more transport layers; it is making planner behavior regression-testable and better documented.

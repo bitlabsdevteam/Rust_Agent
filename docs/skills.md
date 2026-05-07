@@ -45,16 +45,16 @@ Required body sections:
 - Only the currently active skill body is injected into the planner prompt.
 - Selecting a skill activates it in session state; it does not count as task completion.
 - If `allowed_tools` is set, the harness narrows visible tools and blocks disallowed tool execution.
-- Invalid skill files are skipped and reported by `agent_in_rust skills validate`.
+- Invalid skill files are skipped and reported by `agent-in-rust skills validate`.
 
 ## CLI
 
 ```bash
-agent_in_rust skills list
-agent_in_rust skills show --name ship-small
-agent_in_rust skills validate
-agent_in_rust skills create --name ship-small --description "Bias toward the smallest coherent change set"
-agent_in_rust skills install --source owner/repo/skill-name
+agent-in-rust skills list
+agent-in-rust skills show --name ship-small
+agent-in-rust skills validate
+agent-in-rust skills create --name ship-small --description "Bias toward the smallest coherent change set"
+agent-in-rust skills install --source owner/repo/skill-name
 ```
 
 ## Authoring guidance

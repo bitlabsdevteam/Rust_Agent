@@ -8,6 +8,7 @@ mod dispatch;
 mod evals;
 mod mcp;
 mod memory_agent;
+mod planner;
 mod observability;
 mod prompt_layers;
 mod router;
@@ -21,8 +22,10 @@ mod mainAgent;
 use crate::bus::{Bus, InProcessBus};
 use crate::channels::cli::{CliChannel, CliInvocation};
 use crate::channels::ChannelAdapter;
+use crate::dispatch::CHILD_SUBAGENT_COMMAND;
 use crate::mainAgent::{
-    MainAgent, SkillCreateRequest, SkillInstallRequest, WaitModeConfig, DEFAULT_SYSTEM_PROMPT,
+    run_spawned_subagent_child, MainAgent, SkillCreateRequest, SkillInstallRequest, WaitModeConfig,
+    DEFAULT_SYSTEM_PROMPT,
 };
 use crate::router::{DefaultRouter, RouteTarget, Router};
 use crate::worker::{MainAgentWorker, WorkerRequest, WorkerRuntime};
@@ -33,9 +36,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const SYSTEM_PROMPT_DIR: &str = "system_prompt";
+const PUBLIC_BINARY_NAME: &str = "agent-in-rust";
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const RELEASE_TAG: Option<&str> = option_env!("AGENT_IN_RUST_RELEASE_TAG");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    Version,
     Session(SessionOptions),
     List,
     Init,
@@ -135,6 +142,9 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     let mut command_name = args[0].as_str();
     let mut start_index = 1;
     if command_name.starts_with('-') {
+        if matches!(command_name, "--version" | "-V") {
+            return Ok(Command::Version);
+        }
         if matches!(command_name, "--help" | "-h") {
             return Ok(Command::Help(HelpTopic::General));
         }
@@ -143,6 +153,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
     }
 
     match command_name {
+        "version" => Ok(Command::Version),
         "session" => {
             if args[start_index..]
                 .iter()
@@ -229,8 +240,16 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Skills(parse_skills_command(&args[start_index..])?))
         }
         "help" => Ok(Command::Help(parse_help_topic(&args[start_index..])?)),
+        "--version" | "-V" => Ok(Command::Version),
         "--help" | "-h" => Ok(Command::Help(HelpTopic::General)),
         other => Err(CliError::new(format!("Unknown command: {other}"))),
+    }
+}
+
+fn version_text(bin_name: &str, package_version: &str, release_tag: Option<&str>) -> String {
+    match release_tag {
+        Some(tag) if !tag.trim().is_empty() => format!("{bin_name} {package_version} (release tag {tag})"),
+        _ => format!("{bin_name} {package_version}"),
     }
 }
 
@@ -466,7 +485,7 @@ fn parse_skill_validate_options(args: &[String]) -> Result<SkillValidateOptions,
 fn help_text(bin_name: &str, topic: &HelpTopic) -> String {
     match topic {
         HelpTopic::General => format!(
-            "{bin_name} runs a Claude-style local coding session.\n\nDefault entrypoint:\n  {bin_name}                Start chatting\n  {bin_name} --trace        Start chatting and print the execution trace\n\nOther commands:\n  {bin_name} session [--system <prompt>] [--trace]\n  {bin_name} run --input <prompt> [--system <prompt>] [--trace]\n  {bin_name} list\n  {bin_name} compact\n  {bin_name} eval [--fixtures <dir>]\n  {bin_name} skills [list|show|validate|create|install] ...\n  {bin_name} init\n  {bin_name} help [session|run|list|skills|init|compact|eval]\n  {bin_name} help eval\n\nNotes:\n  - Running `{bin_name}` with no command starts the interactive chat session.\n  - The default system prompt loads from files in `system_prompt/` unless `--system` or `AGENT_SYSTEM_PROMPT` overrides it.\n  - Project memory loads from `CLAUDE.md` and imported `@path` files.\n  - Short-term memory resumes from `Workspace/short-term.json` when present.\n  - Final LLM request context snapshots are printed before planner calls and appended to `history/context_history.json`.\n  - Long-term memory uses Mem0 when `MEM0_API_KEY` is configured and falls back to `Workspace/MEMORY.md` otherwise.\n  - Project subagents load from `.claude/agents/*.md`.\n  - Skills load from `.claude/skills/<name>/SKILL.md` and `~/.claude/skills/<name>/SKILL.md`.\n  - Project slash commands load from `.claude/commands/*.md`.\n  - MCP tools remain available when `MCP_SERVERS` is configured.\n"
+            "{bin_name} runs a Claude-style local coding session.\n\nDefault entrypoint:\n  {bin_name}                Start chatting\n  {bin_name} --trace        Start chatting and print the execution trace\n\nOther commands:\n  {bin_name} --version\n  {bin_name} version\n  {bin_name} session [--system <prompt>] [--trace]\n  {bin_name} run --input <prompt> [--system <prompt>] [--trace]\n  {bin_name} list\n  {bin_name} compact\n  {bin_name} eval [--fixtures <dir>]\n  {bin_name} skills [list|show|validate|create|install] ...\n  {bin_name} init\n  {bin_name} help [session|run|list|skills|init|compact|eval]\n  {bin_name} help eval\n\nNotes:\n  - Running `{bin_name}` with no command starts the interactive chat session.\n  - `--version` prints a stable packaged verification string.\n  - The default system prompt loads from files in `system_prompt/` unless `--system` or `AGENT_SYSTEM_PROMPT` overrides it.\n  - Project memory loads from `CLAUDE.md` and imported `@path` files.\n  - Short-term memory resumes from `Workspace/short-term.json` when present.\n  - Final LLM request context snapshots are printed before planner calls and appended to `history/context_history.json`.\n  - Long-term memory uses Mem0 when `MEM0_API_KEY` is configured and falls back to `Workspace/MEMORY.md` otherwise.\n  - Project subagents load from `.claude/agents/*.md`.\n  - Skills load from `.claude/skills/<name>/SKILL.md` and `~/.claude/skills/<name>/SKILL.md`.\n  - Project slash commands load from `.claude/commands/*.md`.\n  - MCP tools remain available when `MCP_SERVERS` is configured.\n"
         ),
         HelpTopic::Session => format!(
             "Start an interactive Claude-style session.\n\nUsage:\n  {bin_name}\n  {bin_name} --trace\n  {bin_name} session\n  {bin_name} session --system <prompt> --trace\n  {bin_name} chat\n\nThe default system prompt is assembled from `system_prompt/` when no override is provided.\n\nIn-session commands:\n  /help\n  /agents\n  /skills\n  /memory\n  /remember <note>\n  /model\n  /clear\n  /compact\n  /mcp\n  /review [task]\n  /skill <name> [task]\n  /init\n  /agent <name> <task>\n  /trace\n  /exit\n"
@@ -709,7 +728,7 @@ fn run_session(agent: &mut MainAgent, options: SessionOptions) -> io::Result<()>
             let request = WorkerRequest::new(request_event).with_wait_mode(WaitModeConfig {
                 prompt_label: "claude".to_string(),
                 show_trace: options.show_trace,
-                bin_name: "agent_in_rust".to_string(),
+                bin_name: PUBLIC_BINARY_NAME.to_string(),
             });
             MainAgentWorker::new(agent).execute(request)?;
         }
@@ -764,14 +783,22 @@ fn run_evals(agent: &MainAgent, options: EvalOptions) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let _ = dotenvy::dotenv();
-    runtime_log::info("main", "process booted");
 
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(|value| value.as_str()) == Some(CHILD_SUBAGENT_COMMAND) {
+        return run_spawned_subagent_child();
+    }
+
+    runtime_log::info("main", "process booted");
     let bin_name = env::args()
         .next()
-        .unwrap_or_else(|| "agent_in_rust".to_string());
+        .unwrap_or_else(|| PUBLIC_BINARY_NAME.to_string());
 
     match parse_command(&args) {
+        Ok(Command::Version) => {
+            println!("{}", version_text(PUBLIC_BINARY_NAME, PACKAGE_VERSION, RELEASE_TAG));
+            Ok(())
+        }
         Ok(Command::Session(options)) => {
             let system_prompt = resolve_system_prompt(options.system_prompt.clone())?;
             let mut agent = MainAgent::from_env(system_prompt)?;
@@ -1044,6 +1071,20 @@ mod tests {
     }
 
     #[test]
+    fn version_flag_returns_version_command() {
+        let command = parse_command(&["--version".to_string()]).expect("command should parse");
+
+        assert_eq!(command, Command::Version);
+    }
+
+    #[test]
+    fn version_subcommand_returns_version_command() {
+        let command = parse_command(&["version".to_string()]).expect("command should parse");
+
+        assert_eq!(command, Command::Version);
+    }
+
+    #[test]
     fn trace_flag_without_command_starts_session() {
         let command = parse_command(&["--trace".to_string()]).expect("command should parse");
 
@@ -1094,10 +1135,24 @@ mod tests {
 
     #[test]
     fn help_text_mentions_eval_command() {
-        let help = help_text("agent_in_rust", &HelpTopic::General);
+        let help = help_text(PUBLIC_BINARY_NAME, &HelpTopic::General);
 
-        assert!(help.contains("agent_in_rust eval"));
+        assert!(help.contains("agent-in-rust eval"));
         assert!(help.contains("help eval"));
+    }
+
+    #[test]
+    fn version_text_reports_public_binary_and_package_version() {
+        let version = version_text(PUBLIC_BINARY_NAME, PACKAGE_VERSION, None);
+
+        assert_eq!(version, format!("agent-in-rust {}", PACKAGE_VERSION));
+    }
+
+    #[test]
+    fn version_text_can_include_release_tag_metadata() {
+        let version = version_text("agent-in-rust", "0.1.0", Some("v0.1.0"));
+
+        assert_eq!(version, "agent-in-rust 0.1.0 (release tag v0.1.0)");
     }
 
     #[test]
@@ -1275,6 +1330,589 @@ mod tests {
             assert!(
                 gap_doc.contains(required_phrase),
                 "gap doc should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v4_spawned_subagent_docs_explain_current_vs_spawned_boundary() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let architecture_path = repo_root.join("docs/architecture.md");
+        let cli_path = repo_root.join("docs/cli.md");
+        let drawio_path = repo_root.join("docs/diagrams/subagent-spawn.drawio");
+        let excalidraw_path = repo_root.join("docs/diagrams/subagent-spawn.excalidraw");
+
+        for path in [&architecture_path, &cli_path, &drawio_path, &excalidraw_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let architecture =
+            fs::read_to_string(&architecture_path).expect("architecture doc should be readable");
+        let cli = fs::read_to_string(&cli_path).expect("CLI doc should be readable");
+        let drawio = fs::read_to_string(&drawio_path).expect("draw.io file should be readable");
+        let excalidraw =
+            fs::read_to_string(&excalidraw_path).expect("excalidraw file should be readable");
+
+        for required_phrase in [
+            "Current synthesized delegation",
+            "Spawned child execution",
+            "ProcessDispatcher",
+            "__spawn-subagent",
+        ] {
+            assert!(
+                architecture.contains(required_phrase),
+                "architecture doc should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "/agent <name> <task>",
+            "spawned child process",
+            "local fallback",
+        ] {
+            assert!(
+                cli.contains(required_phrase),
+                "CLI doc should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in ["Current repo", "Target feature", "Local synthesized subagent"] {
+            assert!(
+                drawio.contains(required_phrase),
+                "draw.io diagram should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Current repo",
+            "Spawned child worker",
+            "Local synthesized",
+        ] {
+            assert!(
+                excalidraw.contains(required_phrase),
+                "excalidraw diagram should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v4_graphify_artifacts_include_spawned_subagent_boundary() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let report_path = repo_root.join("graphify-out/GRAPH_REPORT.md");
+        let graph_path = repo_root.join("graphify-out/graph.json");
+
+        assert!(report_path.is_file(), "expected {:?} to exist", report_path);
+        assert!(graph_path.is_file(), "expected {:?} to exist", graph_path);
+
+        let report = fs::read_to_string(&report_path).expect("graph report should be readable");
+        let graph = fs::read_to_string(&graph_path).expect("graph json should be readable");
+
+        for required_phrase in [
+            "DispatchRequest",
+            "DispatchResponse",
+            "DispatchTarget",
+        ] {
+            assert!(
+                report.contains(required_phrase),
+                "graph report should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "\"label\": \"ProcessDispatcher\"",
+            "\"label\": \"execute_spawned_subagent_request_in_root()\"",
+            "\"label\": \"record_subagent_dispatch_event()\"",
+        ] {
+            assert!(
+                graph.contains(required_phrase),
+                "graph json should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_packaging_docs_define_release_and_install_contract() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let prd_path = repo_root.join("sprints/v5/PRD.md");
+        let tasks_path = repo_root.join("sprints/v5/TASKS.md");
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+
+        for path in [&prd_path, &tasks_path, &readme_path, &install_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let prd = fs::read_to_string(&prd_path).expect("v5 PRD should be readable");
+        let tasks = fs::read_to_string(&tasks_path).expect("v5 tasks should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+
+        for required_phrase in [
+            "cargo-dist",
+            "GitHub Releases",
+            "shell installer",
+            "PowerShell installer",
+            "manual release download",
+            "source-build fallback",
+        ] {
+            assert!(
+                prd.contains(required_phrase),
+                "v5 PRD should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Task 1: Create sprint v5 packaging docs and install contract",
+            "Task 3: Add `cargo-dist` metadata for release artifacts",
+            "Task 4: Add tagged GitHub Actions release automation",
+            "Task 6: Add shell and PowerShell installer support through the release pipeline",
+            "Task 7: Add manual download and contributor fallback install docs",
+        ] {
+            assert!(
+                tasks.contains(required_phrase),
+                "v5 tasks should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Install",
+            "docs/install.md",
+            "GitHub Releases",
+            "manual download",
+            "build from source",
+        ] {
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Supported Targets",
+            "GitHub Releases",
+            "One-Line Install",
+            "Manual Download",
+            "Build From Source",
+            "--version",
+        ] {
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_public_binary_name_is_normalized_across_package_runtime_and_docs() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml_path = repo_root.join("Cargo.toml");
+        let readme_path = repo_root.join("README.md");
+        let cli_path = repo_root.join("docs/cli.md");
+        let install_path = repo_root.join("docs/install.md");
+
+        for path in [&cargo_toml_path, &readme_path, &cli_path, &install_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let cargo_toml =
+            fs::read_to_string(&cargo_toml_path).expect("Cargo.toml should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let cli = fs::read_to_string(&cli_path).expect("CLI doc should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+        let help = help_text("agent-in-rust", &HelpTopic::General);
+
+        assert!(
+            cargo_toml.contains("name = \"agent-in-rust\""),
+            "Cargo.toml should set the public package name"
+        );
+        assert!(
+            cargo_toml.contains("[[bin]]") && cargo_toml.contains("name = \"agent-in-rust\""),
+            "Cargo.toml should explicitly pin the release binary name"
+        );
+
+        for document in [&readme, &cli, &install, &help] {
+            assert!(
+                document.contains("agent-in-rust"),
+                "binary surface should mention the normalized public name"
+            );
+            assert!(
+                !document.contains("agent_in_rust"),
+                "binary surface should not keep the old underscore name"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_cargo_dist_metadata_covers_release_artifacts_and_installers() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml_path = repo_root.join("Cargo.toml");
+        let cargo_toml =
+            fs::read_to_string(&cargo_toml_path).expect("Cargo.toml should be readable");
+
+        for required_phrase in [
+            "[workspace]",
+            "[workspace.metadata.dist]",
+            "cargo-dist-version = \"0.31.0\"",
+            "ci = [\"github\"]",
+            "installers = [\"shell\", \"powershell\"]",
+            "windows-archive = \".zip\"",
+            "unix-archive = \".tar.gz\"",
+            "checksum = \"sha256\"",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+        ] {
+            assert!(
+                cargo_toml.contains(required_phrase),
+                "Cargo.toml should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_release_workflow_is_tag_triggered_and_publishes_dist_artifacts() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workflow_path = repo_root.join(".github/workflows/release.yml");
+
+        assert!(
+            workflow_path.is_file(),
+            "expected {:?} to exist",
+            workflow_path
+        );
+
+        let workflow =
+            fs::read_to_string(&workflow_path).expect("release workflow should be readable");
+
+        for required_phrase in [
+            "name: Release",
+            "push:",
+            "tags:",
+            "- 'v*'",
+            "workflow_dispatch:",
+            "contents: write",
+            "cargo dist plan --output-format=json",
+            "cargo dist build --artifacts=global",
+            "cargo dist build --artifacts=local",
+            "cargo dist host --steps=create,upload,release,announce",
+            "actions/upload-artifact@v4",
+            "actions/download-artifact@v4",
+            "agent-in-rust-installer.sh",
+            "agent-in-rust-installer.ps1",
+            "releases/download/${{ github.ref_name }}",
+        ] {
+            assert!(
+                workflow.contains(required_phrase),
+                "release workflow should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_support_matrix_is_explicit_and_limited_across_config_and_docs() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml_path = repo_root.join("Cargo.toml");
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+
+        for path in [&cargo_toml_path, &readme_path, &install_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let cargo_toml =
+            fs::read_to_string(&cargo_toml_path).expect("Cargo.toml should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+
+        for required_phrase in [
+            "Supported release matrix for v5",
+            "macOS Intel: x86_64-apple-darwin",
+            "macOS Apple Silicon: aarch64-apple-darwin",
+            "Linux x86_64 GNU: x86_64-unknown-linux-gnu",
+            "Linux ARM64 GNU: aarch64-unknown-linux-gnu",
+            "Windows x86_64 MSVC: x86_64-pc-windows-msvc",
+        ] {
+            assert!(
+                cargo_toml.contains(required_phrase),
+                "Cargo.toml should document `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Supported Targets",
+            "Initial release matrix",
+            "macOS Intel (`x86_64-apple-darwin`)",
+            "macOS Apple Silicon (`aarch64-apple-darwin`)",
+            "Linux x86_64 GNU (`x86_64-unknown-linux-gnu`)",
+            "Linux ARM64 GNU (`aarch64-unknown-linux-gnu`)",
+            "Windows x86_64 MSVC (`x86_64-pc-windows-msvc`)",
+            "limited v5 support contract",
+        ] {
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_installer_paths_are_concrete_in_workflow_and_docs() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workflow_path = repo_root.join(".github/workflows/release.yml");
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+
+        for path in [&workflow_path, &readme_path, &install_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let workflow =
+            fs::read_to_string(&workflow_path).expect("release workflow should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+
+        for required_phrase in [
+            "curl --proto '=https' --tlsv1.2 -LsSf",
+            "irm ",
+            "agent-in-rust-installer.sh",
+            "agent-in-rust-installer.ps1",
+            "releases/latest/download/agent-in-rust-installer.sh",
+            "releases/latest/download/agent-in-rust-installer.ps1",
+            "without requiring a Rust toolchain",
+        ] {
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "curl --proto '=https' --tlsv1.2 -LsSf",
+            "irm ",
+            "agent-in-rust-installer.sh",
+            "agent-in-rust-installer.ps1",
+            "releases/download/${{ github.ref_name }}/agent-in-rust-installer.sh",
+            "releases/download/${{ github.ref_name }}/agent-in-rust-installer.ps1",
+        ] {
+            assert!(
+                workflow.contains(required_phrase),
+                "release workflow should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_manual_download_and_source_fallback_are_documented() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+        let cli_path = repo_root.join("docs/cli.md");
+
+        for path in [&readme_path, &install_path, &cli_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+        let cli = fs::read_to_string(&cli_path).expect("CLI doc should be readable");
+
+        for required_phrase in [
+            "Manual Download",
+            "download the archive for their target",
+            "unpack it locally",
+            "place the binary on `PATH`",
+            "Build From Source",
+            "cargo build --release",
+            "target/release/agent-in-rust --version",
+            "cargo install --locked --path .",
+            "contributor fallback",
+        ] {
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Packaging And Install",
+            "manual download",
+            "GitHub Releases",
+            "cargo build --release",
+            "cargo install --locked --path .",
+            "agent-in-rust --version",
+        ] {
+            assert!(
+                cli.contains(required_phrase),
+                "CLI doc should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_version_output_is_stable_and_matches_package_metadata() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml_path = repo_root.join("Cargo.toml");
+        let readme_path = repo_root.join("README.md");
+        let workflow_path = repo_root.join(".github/workflows/release.yml");
+
+        for path in [&cargo_toml_path, &readme_path, &workflow_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let cargo_toml =
+            fs::read_to_string(&cargo_toml_path).expect("Cargo.toml should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let workflow =
+            fs::read_to_string(&workflow_path).expect("release workflow should be readable");
+        let general_help = help_text(PUBLIC_BINARY_NAME, &HelpTopic::General);
+        let version = version_text(PUBLIC_BINARY_NAME, PACKAGE_VERSION, Some(&format!("v{PACKAGE_VERSION}")));
+
+        assert!(
+            cargo_toml.contains(&format!("version = \"{PACKAGE_VERSION}\"")),
+            "Cargo.toml should pin the package version used by the CLI"
+        );
+        assert_eq!(
+            version,
+            format!("agent-in-rust {PACKAGE_VERSION} (release tag v{PACKAGE_VERSION})")
+        );
+
+        for required_phrase in [
+            "--version",
+            "version",
+            "stable packaged verification string",
+            "agent-in-rust --version",
+        ] {
+            assert!(
+                general_help.contains(required_phrase),
+                "help text should mention `{required_phrase}`"
+            );
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "AGENT_IN_RUST_RELEASE_TAG: ${{ github.ref_name }}",
+            "cargo dist build --artifacts=global",
+            "cargo dist build --artifacts=local",
+        ] {
+            assert!(
+                workflow.contains(required_phrase),
+                "release workflow should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_release_artifact_naming_and_docs_stay_aligned() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml_path = repo_root.join("Cargo.toml");
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+        let workflow_path = repo_root.join(".github/workflows/release.yml");
+
+        for path in [&cargo_toml_path, &readme_path, &install_path, &workflow_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let cargo_toml =
+            fs::read_to_string(&cargo_toml_path).expect("Cargo.toml should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+        let workflow =
+            fs::read_to_string(&workflow_path).expect("release workflow should be readable");
+
+        for required_phrase in [
+            "unix-archive = \".tar.gz\"",
+            "windows-archive = \".zip\"",
+            "checksum = \"sha256\"",
+        ] {
+            assert!(
+                cargo_toml.contains(required_phrase),
+                "Cargo.toml should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "Release Artifacts",
+            "agent-in-rust-installer.sh",
+            "agent-in-rust-installer.ps1",
+            ".tar.gz",
+            ".zip",
+            ".sha256",
+            "sha256",
+        ] {
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
+            );
+        }
+
+        for required_phrase in [
+            "agent-in-rust-installer.sh",
+            "agent-in-rust-installer.ps1",
+            "## Installer URLs",
+            "## Installer Commands",
+        ] {
+            assert!(
+                workflow.contains(required_phrase),
+                "release workflow should mention `{required_phrase}`"
+            );
+        }
+    }
+
+    #[test]
+    fn sprint_v5_deferred_extensions_are_documented_without_expanding_scope() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let prd_path = repo_root.join("sprints/v5/PRD.md");
+        let readme_path = repo_root.join("README.md");
+        let install_path = repo_root.join("docs/install.md");
+
+        for path in [&prd_path, &readme_path, &install_path] {
+            assert!(path.is_file(), "expected {:?} to exist", path);
+        }
+
+        let prd = fs::read_to_string(&prd_path).expect("v5 PRD should be readable");
+        let readme = fs::read_to_string(&readme_path).expect("README should be readable");
+        let install = fs::read_to_string(&install_path).expect("install doc should be readable");
+
+        for required_phrase in [
+            "Future Extensions",
+            "Homebrew",
+            "Scoop",
+            "crates.io",
+            "self-update",
+            "not part of the v5 baseline",
+        ] {
+            assert!(
+                prd.contains(required_phrase),
+                "v5 PRD should mention `{required_phrase}`"
+            );
+            assert!(
+                readme.contains(required_phrase),
+                "README should mention `{required_phrase}`"
+            );
+            assert!(
+                install.contains(required_phrase),
+                "install doc should mention `{required_phrase}`"
             );
         }
     }

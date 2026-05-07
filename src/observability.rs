@@ -106,6 +106,25 @@ impl Observability {
     }
 }
 
+pub fn record_subagent_dispatch_event(
+    stage: &str,
+    dispatch_id: &str,
+    subagent_name: &str,
+    launch_mode: &str,
+    error: Option<String>,
+) {
+    let mut attributes = vec![
+        KeyValue::new("subagent.stage", stage.to_string()),
+        KeyValue::new("subagent.dispatch_id", dispatch_id.to_string()),
+        KeyValue::new("subagent.name", subagent_name.to_string()),
+        KeyValue::new("subagent.launch_mode", launch_mode.to_string()),
+    ];
+    if let Some(error) = error {
+        attributes.push(KeyValue::new("subagent.error", compact_text(&error, 500)));
+    }
+    Observability::record_event("subagent.dispatch", attributes);
+}
+
 impl Drop for Observability {
     fn drop(&mut self) {
         if let Some(provider) = self.provider.take() {

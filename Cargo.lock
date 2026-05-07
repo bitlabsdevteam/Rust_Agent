@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agent_in_rust"
+name = "agent-in-rust"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",

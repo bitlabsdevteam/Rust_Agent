@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PlannerEvalFixture {
     pub name: String,
     pub user_input: String,
@@ -14,36 +14,44 @@ pub struct PlannerEvalFixture {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PlannerEvalExpectedDecision {
     pub action: String,
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
+    pub tool_arguments_json: Option<serde_json::Value>,
+    #[serde(default)]
     pub skill_name: Option<String>,
     #[serde(default)]
     pub subagent_name: Option<String>,
+    #[serde(default)]
+    pub failure_class: Option<String>,
+    #[serde(default)]
+    pub reason_contains: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlannerEvalActualDecision {
     pub action: String,
     pub tool_name: Option<String>,
+    pub tool_arguments_json: Option<serde_json::Value>,
     pub skill_name: Option<String>,
     pub subagent_name: Option<String>,
     pub reason: String,
     pub planner_backend: String,
     pub reasoning: Vec<String>,
+    pub failure_class: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlannerEvalCaseResult {
     pub fixture: PlannerEvalFixture,
     pub actual: PlannerEvalActualDecision,
     pub passed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlannerEvalSuiteResult {
     pub fixture_dir: PathBuf,
     pub cases: Vec<PlannerEvalCaseResult>,
@@ -127,18 +135,76 @@ impl PlannerEvalExpectedDecision {
             return false;
         }
 
+        if let Some(expected_reason) = &self.reason_contains {
+            if !actual.reason.contains(expected_reason) {
+                return false;
+            }
+        }
+
         match self.action.as_str() {
-            "tool" => self.tool_name == actual.tool_name,
-            "skill" => self.skill_name == actual.skill_name,
-            "delegate" => self.subagent_name == actual.subagent_name,
-            "finish" | "retry" | "stop" => true,
+            "tool" => {
+                if self.tool_name != actual.tool_name {
+                    return false;
+                }
+                if let Some(expected_arguments) = &self.tool_arguments_json {
+                    if actual.tool_arguments_json.as_ref() != Some(expected_arguments) {
+                        return false;
+                    }
+                }
+                if let Some(expected_failure_class) = &self.failure_class {
+                    if actual.failure_class.as_deref() != Some(expected_failure_class.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            }
+            "skill" => {
+                if self.skill_name != actual.skill_name {
+                    return false;
+                }
+                if let Some(expected_failure_class) = &self.failure_class {
+                    if actual.failure_class.as_deref() != Some(expected_failure_class.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            }
+            "delegate" => {
+                if self.subagent_name != actual.subagent_name {
+                    return false;
+                }
+                if let Some(expected_failure_class) = &self.failure_class {
+                    if actual.failure_class.as_deref() != Some(expected_failure_class.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            }
+            "finish" | "retry" | "stop" => {
+                if let Some(expected_failure_class) = &self.failure_class {
+                    if actual.failure_class.as_deref() != Some(expected_failure_class.as_str()) {
+                        return false;
+                    }
+                }
+                true
+            }
             _ => false,
         }
     }
 
     pub fn summary(&self) -> String {
         match self.action.as_str() {
-            "tool" => format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>")),
+            "tool" => {
+                if let Some(args) = &self.tool_arguments_json {
+                    format!(
+                        "tool:{} {}",
+                        self.tool_name.as_deref().unwrap_or("<missing>"),
+                        args
+                    )
+                } else {
+                    format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>"))
+                }
+            }
             "skill" => format!(
                 "skill:{}",
                 self.skill_name.as_deref().unwrap_or("<missing>")
@@ -147,7 +213,13 @@ impl PlannerEvalExpectedDecision {
                 "delegate:{}",
                 self.subagent_name.as_deref().unwrap_or("<missing>")
             ),
-            other => other.to_string(),
+            other => {
+                if let Some(failure_class) = &self.failure_class {
+                    format!("{other}:{failure_class}")
+                } else {
+                    other.to_string()
+                }
+            }
         }
     }
 }
@@ -155,7 +227,17 @@ impl PlannerEvalExpectedDecision {
 impl PlannerEvalActualDecision {
     pub fn summary(&self) -> String {
         match self.action.as_str() {
-            "tool" => format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>")),
+            "tool" => {
+                if let Some(args) = &self.tool_arguments_json {
+                    format!(
+                        "tool:{} {}",
+                        self.tool_name.as_deref().unwrap_or("<missing>"),
+                        args
+                    )
+                } else {
+                    format!("tool:{}", self.tool_name.as_deref().unwrap_or("<missing>"))
+                }
+            }
             "skill" => format!(
                 "skill:{}",
                 self.skill_name.as_deref().unwrap_or("<missing>")
@@ -164,7 +246,13 @@ impl PlannerEvalActualDecision {
                 "delegate:{}",
                 self.subagent_name.as_deref().unwrap_or("<missing>")
             ),
-            other => other.to_string(),
+            other => {
+                if let Some(failure_class) = &self.failure_class {
+                    format!("{other}:{failure_class}")
+                } else {
+                    other.to_string()
+                }
+            }
         }
     }
 }
@@ -366,17 +454,74 @@ mod tests {
         let expected = PlannerEvalExpectedDecision {
             action: "tool".to_string(),
             tool_name: Some("web_search_tool".to_string()),
+            tool_arguments_json: Some(serde_json::json!({})),
             skill_name: None,
             subagent_name: None,
+            failure_class: None,
+            reason_contains: None,
         };
         let actual = PlannerEvalActualDecision {
             action: "tool".to_string(),
             tool_name: Some("web_search_tool".to_string()),
+            tool_arguments_json: Some(serde_json::json!({})),
             skill_name: None,
             subagent_name: None,
             reason: "explicit tool request".to_string(),
             planner_backend: "local heuristic planner".to_string(),
             reasoning: vec!["Explicit tool request detected.".to_string()],
+            failure_class: None,
+        };
+
+        assert!(expected.matches(&actual));
+    }
+
+    #[test]
+    fn expected_decision_matches_retry_failure_class_and_reason() {
+        let expected = PlannerEvalExpectedDecision {
+            action: "retry".to_string(),
+            tool_name: None,
+            tool_arguments_json: None,
+            skill_name: None,
+            subagent_name: None,
+            failure_class: Some("recoverable".to_string()),
+            reason_contains: Some("recoverable failure".to_string()),
+        };
+        let actual = PlannerEvalActualDecision {
+            action: "retry".to_string(),
+            tool_name: None,
+            tool_arguments_json: None,
+            skill_name: None,
+            subagent_name: None,
+            reason: "the latest observation still reflects a recoverable failure".to_string(),
+            planner_backend: "local heuristic planner".to_string(),
+            reasoning: vec!["The heuristic router preserved retry semantics.".to_string()],
+            failure_class: Some("recoverable".to_string()),
+        };
+
+        assert!(expected.matches(&actual));
+    }
+
+    #[test]
+    fn expected_decision_matches_delegate_target_and_reason() {
+        let expected = PlannerEvalExpectedDecision {
+            action: "delegate".to_string(),
+            tool_name: None,
+            tool_arguments_json: None,
+            skill_name: None,
+            subagent_name: Some("plan".to_string()),
+            failure_class: None,
+            reason_contains: Some("No explicit tool request".to_string()),
+        };
+        let actual = PlannerEvalActualDecision {
+            action: "delegate".to_string(),
+            tool_name: None,
+            tool_arguments_json: None,
+            skill_name: None,
+            subagent_name: Some("plan".to_string()),
+            reason: "No explicit tool request was inferred.".to_string(),
+            planner_backend: "local heuristic planner".to_string(),
+            reasoning: vec!["No model-backed planner succeeded; using the local heuristic router.".to_string()],
+            failure_class: None,
         };
 
         assert!(expected.matches(&actual));
@@ -391,8 +536,11 @@ mod tests {
             expected: PlannerEvalExpectedDecision {
                 action: "tool".to_string(),
                 tool_name: Some("web_search_tool".to_string()),
+                tool_arguments_json: Some(serde_json::json!({})),
                 skill_name: None,
                 subagent_name: None,
+                failure_class: None,
+                reason_contains: None,
             },
         };
         let passing = PlannerEvalCaseResult {
@@ -400,11 +548,13 @@ mod tests {
             actual: PlannerEvalActualDecision {
                 action: "tool".to_string(),
                 tool_name: Some("web_search_tool".to_string()),
+                tool_arguments_json: Some(serde_json::json!({})),
                 skill_name: None,
                 subagent_name: None,
                 reason: "explicit tool request".to_string(),
                 planner_backend: "local heuristic planner".to_string(),
                 reasoning: vec!["Explicit tool request detected.".to_string()],
+                failure_class: None,
             },
             passed: true,
         };
@@ -413,6 +563,7 @@ mod tests {
             actual: PlannerEvalActualDecision {
                 action: "delegate".to_string(),
                 tool_name: None,
+                tool_arguments_json: None,
                 skill_name: None,
                 subagent_name: Some("general-purpose".to_string()),
                 reason: "default delegation".to_string(),
@@ -421,6 +572,7 @@ mod tests {
                     "No explicit tool request was inferred.".to_string(),
                     "No explicit skill request was inferred.".to_string(),
                 ],
+                failure_class: Some("terminal".to_string()),
             },
             passed: false,
         };
@@ -433,7 +585,7 @@ mod tests {
         assert!(report.contains("Planner evals: 1 passed, 1 failed"));
         assert!(report.contains("[PASS] tool routing"));
         assert!(report.contains("[FAIL] tool routing"));
-        assert!(report.contains("expected: tool:web_search_tool"));
+        assert!(report.contains("expected: tool:web_search_tool {}"));
         assert!(report.contains("actual: delegate:general-purpose"));
         assert!(report.contains("input: search the web"));
         assert!(report.contains("planner backend: local heuristic planner"));

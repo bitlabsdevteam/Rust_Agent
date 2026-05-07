@@ -11,18 +11,18 @@ This repository is operated as a local CLI agent. The command surface is intenti
 - manage reusable skills
 - scaffold missing project files
 
-The examples below use `agent_in_rust` as the binary name.
+The examples below use `agent-in-rust` as the public binary name.
 
 ## Top-Level Commands
 
 ### Start an interactive session
 
 ```bash
-agent_in_rust
-agent_in_rust --trace
-agent_in_rust session
-agent_in_rust session --system "custom system prompt" --trace
-agent_in_rust chat
+agent-in-rust
+agent-in-rust --trace
+agent-in-rust session
+agent-in-rust session --system "custom system prompt" --trace
+agent-in-rust chat
 ```
 
 Use this mode when you want a persistent local session with slash commands, short-term memory, and trace visibility.
@@ -34,8 +34,8 @@ Internally, CLI input now enters the same control-plane seam used by future chan
 ### Run a one-shot prompt
 
 ```bash
-agent_in_rust run --input "Plan the refactor"
-agent_in_rust run --input "Use tool web_search_tool with {\"query\":\"latest Rust 2026 edition updates\"}" --trace
+agent-in-rust run --input "Plan the refactor"
+agent-in-rust run --input "Use tool web_search_tool with {\"query\":\"latest Rust 2026 edition updates\"}" --trace
 ```
 
 Use this when you want a single request without entering the interactive REPL.
@@ -43,7 +43,7 @@ Use this when you want a single request without entering the interactive REPL.
 ### Inspect loaded runtime state
 
 ```bash
-agent_in_rust list
+agent-in-rust list
 ```
 
 This prints:
@@ -60,7 +60,7 @@ This prints:
 ### Compact stored short-term context
 
 ```bash
-agent_in_rust compact
+agent-in-rust compact
 ```
 
 This loads `Workspace/short-term.json`, summarizes older turns into the compacted summary, retains the recent suffix, and writes the updated snapshot back to disk.
@@ -68,14 +68,14 @@ This loads `Workspace/short-term.json`, summarizes older turns into the compacte
 ### Manage skills
 
 ```bash
-agent_in_rust skills
-agent_in_rust skills list
-agent_in_rust skills show --name ship-small
-agent_in_rust skills validate
-agent_in_rust skills validate --name ship-small
-agent_in_rust skills create --name ship-small --description "Bias toward the smallest coherent change set"
-agent_in_rust skills install --source owner/repo/skill-name
-agent_in_rust skills install --source /absolute/path/to/skill --scope user
+agent-in-rust skills
+agent-in-rust skills list
+agent-in-rust skills show --name ship-small
+agent-in-rust skills validate
+agent-in-rust skills validate --name ship-small
+agent-in-rust skills create --name ship-small --description "Bias toward the smallest coherent change set"
+agent-in-rust skills install --source owner/repo/skill-name
+agent-in-rust skills install --source /absolute/path/to/skill --scope user
 ```
 
 Skill sources are loaded from:
@@ -93,7 +93,7 @@ Behavior notes:
 ### Scaffold missing project files
 
 ```bash
-agent_in_rust init
+agent-in-rust init
 ```
 
 This creates missing starter artifacts such as:
@@ -108,13 +108,13 @@ This creates missing starter artifacts such as:
 ### Get help
 
 ```bash
-agent_in_rust help
-agent_in_rust help session
-agent_in_rust help run
-agent_in_rust help list
-agent_in_rust help skills
-agent_in_rust help init
-agent_in_rust help compact
+agent-in-rust help
+agent-in-rust help session
+agent-in-rust help run
+agent-in-rust help list
+agent-in-rust help skills
+agent-in-rust help init
+agent-in-rust help compact
 ```
 
 ## Interactive Session Commands
@@ -194,7 +194,7 @@ Use:
 or
 
 ```bash
-agent_in_rust compact
+agent-in-rust compact
 ```
 
 Manual compaction summarizes older turns into the compacted summary and retains the recent turns.
@@ -205,10 +205,39 @@ During normal runtime execution, the agent may auto-compact when active history 
 
 ## Operator Workflows
 
+### Packaging And Install
+
+Use GitHub Releases for packaged installs:
+
+- one-line installer paths for supported macOS/Linux and Windows targets
+- manual download when you want to inspect the archive before putting the binary on `PATH`
+
+Manual download flow:
+
+1. open GitHub Releases
+2. download the archive for your target
+3. unpack it locally
+4. place the binary on `PATH`
+5. run `agent-in-rust --version`
+
+Contributor fallback:
+
+```bash
+cargo install --locked --path .
+agent-in-rust --version
+```
+
+Or build directly:
+
+```bash
+cargo build --release
+./target/release/agent-in-rust --version
+```
+
 ### Inspect the current runtime surface
 
 ```bash
-agent_in_rust list
+agent-in-rust list
 ```
 
 Use this first when you want to see what the agent has loaded before making changes.
@@ -216,7 +245,7 @@ Use this first when you want to see what the agent has loaded before making chan
 ### Start a debugging session with trace output
 
 ```bash
-agent_in_rust --trace
+agent-in-rust --trace
 ```
 
 Then use `/trace` inside the session to toggle trace printing on or off.
@@ -262,11 +291,20 @@ Use this when a reusable skill should shape the next action.
 ```
 
 Use this when you want a bounded exploratory or planning handoff.
+The parent session launches a spawned child process, passes a compact context packet, and records the child result in the trace.
+When child spawning is unavailable, the runtime uses a local fallback path and records that launch mode in the trace.
+
+Operational details:
+
+- the user-facing command stays `/agent <name> <task>`
+- the spawned child process is an internal runtime path, not a separate user command
+- the same binary enters child mode through the hidden `__spawn-subagent` command
+- the parent still owns the delegation decision and receives the structured child result
 
 ## Operational Notes
 
 - The default model policy is OpenAI GPT-5.4 with Opus 4.6 fallback.
-- The planner may fall back to a local heuristic router if model-backed planning is unavailable.
+- The planner may use a local heuristic router only when no model-backed planner is configured.
 - MCP tools are available only when `MCP_SERVERS` is configured.
 - `session` mode preserves local state; `run` mode is better for scripted or one-off use.
 - `clear` resets short-term session state but does not remove project memory.

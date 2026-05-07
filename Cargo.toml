@@ -1,7 +1,36 @@
 [package]
-name = "agent_in_rust"
+name = "agent-in-rust"
 version = "0.1.0"
 edition = "2021"
+default-run = "agent-in-rust"
+
+[[bin]]
+name = "agent-in-rust"
+path = "src/main.rs"
+
+[workspace]
+members = ["."]
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.31.0"
+ci = ["github"]
+installers = ["shell", "powershell"]
+# Supported release matrix for v5:
+# - macOS Intel: x86_64-apple-darwin
+# - macOS Apple Silicon: aarch64-apple-darwin
+# - Linux x86_64 GNU: x86_64-unknown-linux-gnu
+# - Linux ARM64 GNU: aarch64-unknown-linux-gnu
+# - Windows x86_64 MSVC: x86_64-pc-windows-msvc
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+checksum = "sha256"
 
 [dependencies]
 base64 = "0.22"

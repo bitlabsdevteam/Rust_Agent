@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: agent-in-rust
+  CARGO_DIST_VERSION: 0.31.0
+  DIST_ARTIFACT_DIR: target/distrib
+
+jobs:
+  plan-release:
+    name: Plan Release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked --version "${CARGO_DIST_VERSION}"
+
+      - name: Generate release manifest
+        run: |
+          mkdir -p "${DIST_ARTIFACT_DIR}"
+          cargo dist plan --output-format=json > "${DIST_ARTIFACT_DIR}/dist-manifest.json"
+
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-manifest
+          path: target/distrib/dist-manifest.json
+
+  build-release:
+    name: Build Release (${{ matrix.runner }} / ${{ matrix.artifacts }})
+    needs: plan-release
+    runs-on: ${{ matrix.runner }}
+    env:
+      AGENT_IN_RUST_RELEASE_TAG: ${{ github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifacts: global
+          - runner: ubuntu-24.04
+            artifacts: local
+          - runner: macos-13
+            artifacts: local
+          - runner: macos-14
+            artifacts: local
+          - runner: windows-2022
+            artifacts: local
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked --version "${CARGO_DIST_VERSION}"
+
+      - name: Download release manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-manifest
+          path: target/distrib
+
+      - name: Build global release artifacts
+        if: matrix.artifacts == 'global'
+        run: cargo dist build --artifacts=global
+
+      - name: Build local release artifacts
+        if: matrix.artifacts == 'local'
+        run: cargo dist build --artifacts=local
+
+      - name: Upload built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.runner }}-${{ matrix.artifacts }}
+          path: target/distrib
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked --version "${CARGO_DIST_VERSION}"
+
+      - name: Download release manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-manifest
+          path: target/distrib
+
+      - name: Download built release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: target/distrib
+          merge-multiple: true
+
+      - name: Publish release artifacts to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo dist host --steps=create,upload,release,announce
+
+      - name: Write installer URLs to the workflow summary
+        run: |
+          echo "## Installer URLs" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- macOS/Linux: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/agent-in-rust-installer.sh" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Windows PowerShell: ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/agent-in-rust-installer.ps1" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "## Installer Commands" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```bash' >> "${GITHUB_STEP_SUMMARY}"
+          echo "curl --proto '=https' --tlsv1.2 -LsSf ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/agent-in-rust-installer.sh | sh" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```powershell' >> "${GITHUB_STEP_SUMMARY}"
+          echo "irm ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/agent-in-rust-installer.ps1 | iex" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"

@@ -4,6 +4,7 @@
   "observations": [],
   "expected": {
     "action": "skill",
-    "skill_name": "ship-small"
+    "skill_name": "ship-small",
+    "reason_contains": "Explicit skill request detected"
   }
 }

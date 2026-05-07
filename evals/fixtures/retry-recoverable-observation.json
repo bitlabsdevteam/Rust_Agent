@@ -5,6 +5,8 @@
     "Recoverable tool failure from `web_search_tool`: timeout"
   ],
   "expected": {
-    "action": "retry"
+    "action": "retry",
+    "failure_class": "recoverable",
+    "reason_contains": "recoverable failure"
   }
 }
